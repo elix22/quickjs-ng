@@ -1307,6 +1307,22 @@ static inline void js_aot_el_putd(JSContext *ctx, JSValue arr, uint32_t idx, dou
     *pe = js_aot_float64(d);
     JS_FreeValue(ctx, old);
 }
+/* Body read of `arr.length` — legal only after js_aot_arr_fast at entry.
+   NOT u.array.count: the length property (always prop[0] for JS_CLASS_ARRAY,
+   created at birth, non-configurable) may EXCEED count after `a.length = n`.
+   It is always a number (int-tagged, or float64 past 2^31), so JS_AOT_NUM
+   covers it unchecked. */
+static inline double js_aot_arr_len(JSValue arr)
+{
+    return JS_AOT_NUM(JS_VALUE_GET_OBJ(arr)->prop[0].u.value);
+}
+/* Borrowed peek at a closure variable — the region-entry guard / body read for
+   var-ref bases (v3.5a). Pure pointer load; the cell owns a reference, and no
+   call can run mid-region to rebind or free it. */
+static inline JSValue js_aot_var_ref_peek(JSVarRef **var_refs, int idx)
+{
+    return *var_refs[idx]->pvalue;
+}
 /* Entry guard for NUMERIC-FIELD regions (v3.4): `v` is a plain object
    (JS_CLASS_OBJECT — no exotic get/set behavior) with an own DATA property
    `atom` (not getter/varref/autoinit). Returns the property slot, NULL = deopt.
