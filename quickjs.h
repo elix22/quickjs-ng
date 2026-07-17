@@ -1241,6 +1241,46 @@ JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
    returns a module. */
 JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
 
+/* ---- TNR AOT extension (fork patch; threejs-native-runtime plan §5.4) --------------
+   Doctrine: the interpreter stays the source of truth; AOT is an accelerator.
+   A JSFunctionBytecode may carry a generated-C "twin" (aot_func). JS_CallInternal
+   dispatches to the twin when present (plain calls only — constructor/generator
+   calls always interpret); everything else interprets. Twins are produced offline
+   by tnr-aotc and bound BY CONTENT HASH, so a stale table entry can never bind to
+   the wrong function — worst case is a miss, i.e. interpretation. */
+typedef struct JSFunctionBytecode JSFunctionBytecode; /* opaque to embedders */
+typedef struct JSVarRef JSVarRef;                     /* opaque to embedders */
+typedef JSValue (*JSAOTFunc)(JSContext *ctx, JSValueConst func_obj,
+                             JSValueConst this_val, int argc, JSValueConst *argv,
+                             JSFunctionBytecode *b, JSVarRef **var_refs);
+typedef struct JSAOTEntry {
+    uint64_t fn_hash; /* JS_AOTFunctionHash of the target function */
+    JSAOTFunc fn;
+} JSAOTEntry;
+/* Content hash of one function: FNV-1a 64 over the opcode stream with atom
+   operands normalized to their string payloads (atom INDICES are run-dependent),
+   mixed with the function's shape (arg/var/stack counts, flags) and its constant
+   pool — child function bytecodes hash recursively (Merkle), so the hash pins the
+   whole subtree. Stable across processes and serialization round-trips. */
+JS_EXTERN uint64_t JS_AOTFunctionHash(JSContext *ctx, JSFunctionBytecode *b);
+/* Walk the function tree under 'root' (a module / bytecode-function value from
+   JS_ReadObject or JS_Eval(COMPILE_ONLY), or a live function object), calling cb
+   for every JSFunctionBytecode reachable through constant pools. Returns the
+   number of functions visited, or -1 on an unsupported root tag. */
+typedef void (*JSAOTEnumFunc)(void *ud, JSContext *ctx, JSFunctionBytecode *b,
+                              uint64_t fn_hash);
+JS_EXTERN int JS_AOTEnumFunctions(JSContext *ctx, JSValueConst root,
+                                  JSAOTEnumFunc cb, void *ud);
+/* Install twins from 'table' (sorted ascending by fn_hash) over the function tree
+   under 'root'. Returns the number installed. Honors TNR_NO_AOT=1 in the
+   environment (returns 0 without installing) — the differential-testing switch. */
+JS_EXTERN int JS_AOTInstallTable(JSContext *ctx, JSValueConst root,
+                                 const JSAOTEntry *table, size_t count);
+/* Accessors generated code and tnr-aotc need (JSFunctionBytecode is opaque). */
+JS_EXTERN const uint8_t *JS_AOTGetBytecode(const JSFunctionBytecode *b, int *plen);
+JS_EXTERN void JS_AOTGetShape(const JSFunctionBytecode *b, int *parg_count,
+                              int *pvar_count, int *pstack_size, int *pcpool_count);
+
 /* only exported for os.Worker() */
 JS_EXTERN JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
 /* only exported for os.Worker() */

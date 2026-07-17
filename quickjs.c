@@ -812,6 +812,10 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+    /* TNR AOT (fork patch): generated-C twin, NULL = interpret. Both allocation
+       paths (js_create_function, JS_ReadFunctionTag) js_mallocz the struct, so
+       the default is guaranteed NULL. Installed by JS_AOTInstallTable. */
+    JSAOTFunc aot_func;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -17627,6 +17631,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          argv, flags);
     }
     b = p->u.func.function_bytecode;
+
+    /* TNR AOT (fork patch, plan §5.4): a function with a generated C twin
+       dispatches to it — one branch on the hot path, interpreter untouched
+       otherwise. Plain calls only: constructor calls need new_target/prototype
+       handling and generators resume mid-frame; both always interpret (twins
+       are never generated for them in v1 anyway — belt and braces). */
+    if (unlikely(b->aot_func != NULL) &&
+        !(flags & (JS_CALL_FLAG_CONSTRUCTOR | JS_CALL_FLAG_GENERATOR))) {
+        return b->aot_func(caller_ctx, func_obj, this_obj, argc, argv, b,
+                           p->u.func.var_refs);
+    }
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
@@ -63424,3 +63439,213 @@ uintptr_t js_std_cmd(int cmd, ...) {
 #undef malloc
 #undef free
 #undef realloc
+
+/* ------------------------------------------------------------------------------------
+   TNR AOT extension implementation (fork patch; threejs-native-runtime plan §5.4).
+
+   See the doctrine note in quickjs.h next to JSAOTFunc. The pieces here:
+
+   * JS_AOTFunctionHash — content identity of ONE function: FNV-1a 64 over the
+     function "shape" (arg/var/stack counts, flags) + the opcode stream with ATOM
+     OPERANDS NORMALIZED to their string payloads. Atom indices are process-local
+     (the bytecode reader remaps them into the runtime's atom table), so raw
+     stream bytes never match between tnr-aotc's compile and the runtime's
+     JS_ReadObject — the atom STRINGS do.
+     Constant-pool VALUES are deliberately NOT hashed: a generated twin reads
+     cpool/atom/var_ref operands through the runtime JSFunctionBytecode it is
+     attached to, so two functions with identical streams but different constants
+     share one (equally correct) twin. Collisions only matter across DIFFERENT
+     opcode streams; 64-bit FNV over ~10^4 bundle functions is comfortable.
+     Byte order: payloads are hashed as memory bytes — all supported targets are
+     little-endian; revisit if that ever changes.
+
+   * JS_AOTEnumFunctions — depth-first walk over cpool-reachable child functions.
+
+   * JS_AOTInstallTable — bsearch per visited function; TNR_NO_AOT=1 disables
+     (the differential-testing switch: same binary, interpreter-only).
+ */
+
+#define TNR_AOT_FNV_INIT 0xcbf29ce484222325ULL
+
+static uint64_t tnr_aot_fnv1a(uint64_t h, const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    while (len--) {
+        h ^= *p++;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static uint64_t tnr_aot_hash_u32(uint64_t h, uint32_t v)
+{
+    uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    return tnr_aot_fnv1a(h, b, 4);
+}
+
+static uint64_t tnr_aot_hash_atom(uint64_t h, JSRuntime *rt, JSAtom atom)
+{
+    if (atom == JS_ATOM_NULL)
+        return tnr_aot_fnv1a(h, "\0N", 2);
+    if (__JS_AtomIsTaggedInt(atom)) {
+        h = tnr_aot_fnv1a(h, "\0I", 2);
+        return tnr_aot_hash_u32(h, __JS_AtomToUInt32(atom));
+    }
+    JSAtomStruct *p = rt->atom_array[atom];
+    h = tnr_aot_fnv1a(h, "\0A", 2);
+    h = tnr_aot_hash_u32(h, p->len);
+    if (p->is_wide_char)
+        return tnr_aot_fnv1a(h, str16(p), (size_t)p->len * 2);
+    return tnr_aot_fnv1a(h, str8(p), p->len);
+}
+
+uint64_t JS_AOTFunctionHash(JSContext *ctx, JSFunctionBytecode *b)
+{
+    JSRuntime *rt = ctx->rt;
+    uint64_t h = TNR_AOT_FNV_INIT;
+
+    /* shape */
+    h = tnr_aot_hash_u32(h, b->arg_count);
+    h = tnr_aot_hash_u32(h, b->var_count);
+    h = tnr_aot_hash_u32(h, b->defined_arg_count);
+    h = tnr_aot_hash_u32(h, b->stack_size);
+    h = tnr_aot_hash_u32(h, b->closure_var_count);
+    h = tnr_aot_hash_u32(h, b->cpool_count);
+    h = tnr_aot_hash_u32(h, (uint32_t)b->byte_code_len);
+    h = tnr_aot_hash_u32(h, (uint32_t)(b->is_strict_mode |
+                                       (b->func_kind << 1) |
+                                       (b->has_prototype << 3) |
+                                       (b->has_simple_parameter_list << 4) |
+                                       (b->is_derived_class_constructor << 5) |
+                                       (b->new_target_allowed << 6) |
+                                       (b->super_call_allowed << 7) |
+                                       (b->super_allowed << 8) |
+                                       (b->arguments_allowed << 9)));
+    h = tnr_aot_hash_atom(h, rt, b->func_name);
+
+    /* opcode stream, atoms normalized */
+    {
+        const uint8_t *pc = b->byte_code_buf, *end = pc + b->byte_code_len;
+        while (pc < end) {
+            uint8_t op = *pc;
+            const JSOpCode *oi = &short_opcode_info(op);
+            int size = oi->size;
+            if (size < 1 || pc + size > end)
+                break; /* malformed stream — hash what we saw */
+            h = tnr_aot_fnv1a(h, &op, 1);
+            switch (oi->fmt) {
+            case OP_FMT_atom:
+            case OP_FMT_atom_u8:
+            case OP_FMT_atom_u16:
+            case OP_FMT_atom_label_u8:
+            case OP_FMT_atom_label_u16:
+                /* u32 atom at pc+1; hash its payload, then the rest raw */
+                h = tnr_aot_hash_atom(h, rt, get_u32(pc + 1));
+                h = tnr_aot_fnv1a(h, pc + 5, size - 5);
+                break;
+            default:
+                h = tnr_aot_fnv1a(h, pc + 1, size - 1);
+                break;
+            }
+            pc += size;
+        }
+    }
+    return h;
+}
+
+static int tnr_aot_walk(JSContext *ctx, JSFunctionBytecode *b,
+                        JSAOTEnumFunc cb, void *ud)
+{
+    int i, n = 1;
+    cb(ud, ctx, b, JS_AOTFunctionHash(ctx, b));
+    for (i = 0; i < b->cpool_count; i++) {
+        if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
+            n += tnr_aot_walk(ctx, JS_VALUE_GET_PTR(b->cpool[i]), cb, ud);
+    }
+    return n;
+}
+
+/* Accept every shape a "function tree root" shows up in: the value JS_ReadObject/
+   JS_Eval(COMPILE_ONLY) returns (module or bare bytecode), or a live function. */
+static JSFunctionBytecode *tnr_aot_root_bytecode(JSValueConst root)
+{
+    switch (JS_VALUE_GET_TAG(root)) {
+    case JS_TAG_FUNCTION_BYTECODE:
+        return JS_VALUE_GET_PTR(root);
+    case JS_TAG_MODULE: {
+        JSModuleDef *m = JS_VALUE_GET_PTR(root);
+        return tnr_aot_root_bytecode(m->func_obj);
+    }
+    case JS_TAG_OBJECT: {
+        JSObject *p = JS_VALUE_GET_OBJ(root);
+        if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+            return p->u.func.function_bytecode;
+        return NULL;
+    }
+    default:
+        return NULL;
+    }
+}
+
+int JS_AOTEnumFunctions(JSContext *ctx, JSValueConst root, JSAOTEnumFunc cb, void *ud)
+{
+    JSFunctionBytecode *b = tnr_aot_root_bytecode(root);
+    if (!b)
+        return -1;
+    return tnr_aot_walk(ctx, b, cb, ud);
+}
+
+typedef struct {
+    const JSAOTEntry *table;
+    size_t count;
+    int installed;
+} TnrAotInstallCtx;
+
+static void tnr_aot_install_cb(void *ud, JSContext *ctx, JSFunctionBytecode *b,
+                               uint64_t fn_hash)
+{
+    TnrAotInstallCtx *ic = ud;
+    size_t lo = 0, hi = ic->count;
+    (void)ctx;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (ic->table[mid].fn_hash < fn_hash)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < ic->count && ic->table[lo].fn_hash == fn_hash) {
+        b->aot_func = ic->table[lo].fn;
+        ic->installed++;
+    }
+}
+
+int JS_AOTInstallTable(JSContext *ctx, JSValueConst root,
+                       const JSAOTEntry *table, size_t count)
+{
+    TnrAotInstallCtx ic = { table, count, 0 };
+    const char *no_aot = getenv("TNR_NO_AOT");
+    if (no_aot && no_aot[0] && no_aot[0] != '0')
+        return 0;
+    if (!table || !count)
+        return 0;
+    if (JS_AOTEnumFunctions(ctx, root, tnr_aot_install_cb, &ic) < 0)
+        return -1;
+    return ic.installed;
+}
+
+const uint8_t *JS_AOTGetBytecode(const JSFunctionBytecode *b, int *plen)
+{
+    if (plen)
+        *plen = b->byte_code_len;
+    return b->byte_code_buf;
+}
+
+void JS_AOTGetShape(const JSFunctionBytecode *b, int *parg_count,
+                    int *pvar_count, int *pstack_size, int *pcpool_count)
+{
+    if (parg_count)   *parg_count = b->arg_count;
+    if (pvar_count)   *pvar_count = b->var_count;
+    if (pstack_size)  *pstack_size = b->stack_size;
+    if (pcpool_count) *pcpool_count = b->cpool_count;
+}
