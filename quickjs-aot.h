@@ -224,6 +224,10 @@ JS_EXTERN int JS_AOTOpPutVarRefCheck(JSContext *ctx, JSValue **psp, JSFunctionBy
 JS_EXTERN void JS_AOTOpCloseLoc(JSContext *ctx, JSAOTFrame *frame, JSFunctionBytecode *b,
                                 int idx);
 JS_EXTERN int JS_AOTOpSetName(JSContext *ctx, JSValue **psp, JSAtom atom);
+JS_EXTERN int JS_AOTOpGetLength(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                                const uint8_t *next_pc);
+JS_EXTERN int JS_AOTOpToPropKey(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                                const uint8_t *next_pc, int check_obj);
 JS_EXTERN int JS_AOTOpArrayFrom(JSContext *ctx, JSValue **psp, int argc);
 JS_EXTERN void JS_AOTOpTypeofIs(JSContext *ctx, JSValue **psp, int is_function);
 
