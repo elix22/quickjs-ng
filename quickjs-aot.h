@@ -193,6 +193,10 @@ JS_EXTERN int JS_AOTOpToBoolFree(JSContext *ctx, JSValue v); /* branch condition
 JS_EXTERN int JS_AOTThrowUninit(JSContext *ctx, JSFunctionBytecode *b, int idx,
                                 int is_ref);  /* always returns -1 */
 JS_EXTERN int JS_AOTThrowNonCtor(JSContext *ctx); /* OP_check_ctor; returns -1 */
+/* Twin exception-label duty: attach the backtrace at the throw-adjacent frame
+   exactly like the interpreter's `exception:` label (Error.prepareStackTrace
+   timing is observable — see the comment at the definition). */
+JS_EXTERN void JS_AOTExceptionBacktrace(JSContext *ctx, JSAOTFrame *frame);
 
 /* per-site inline caches (v2): opaque here; the generated file (compiled in-TU)
    defines the array and publishes it via tnr_aot_ic_table/count for reset.

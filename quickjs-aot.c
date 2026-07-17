@@ -1140,6 +1140,22 @@ int JS_AOTOpPutFieldIC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
     return 0;
 }
 
+/* The interpreter's `exception:` label attaches the backtrace AT THE THROW-
+   ADJACENT FRAME — observable via Error.prepareStackTrace: at stack-overflow
+   depth the prepare call itself overflows and is suppressed (quickjs tests
+   assert calls == 0, bug904). Twins must do the same at their exception label,
+   or the error propagates bare until the first interpreted frame, where the
+   unwound stack lets prepare SUCCEED — a semantic divergence the engine-test
+   differential caught. cur_pc holds whatever the failing helper set. */
+void JS_AOTExceptionBacktrace(JSContext *ctx, JSAOTFrame *frame)
+{
+    JSRuntime *rt = ctx->rt;
+    (void)frame;
+    if (needs_backtrace(rt->current_exception) ||
+        JS_IsUndefined(ctx->error_back_trace))
+        build_backtrace(ctx, rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+}
+
 int JS_AOTThrowNonCtor(JSContext *ctx)
 {
     JS_ThrowTypeError(ctx, "class constructors must be invoked with 'new'");
