@@ -1278,8 +1278,17 @@ JS_EXTERN int JS_AOTInstallTable(JSContext *ctx, JSValueConst root,
                                  const JSAOTEntry *table, size_t count);
 /* Accessors generated code and tnr-aotc need (JSFunctionBytecode is opaque). */
 JS_EXTERN const uint8_t *JS_AOTGetBytecode(const JSFunctionBytecode *b, int *plen);
-JS_EXTERN void JS_AOTGetShape(const JSFunctionBytecode *b, int *parg_count,
-                              int *pvar_count, int *pstack_size, int *pcpool_count);
+#define JS_AOT_SHAPE_STRICT      (1 << 0)
+#define JS_AOT_SHAPE_FUNC_KIND   (3 << 1)  /* JSFunctionKindEnum << 1; 0 = normal */
+#define JS_AOT_SHAPE_ARGUMENTS   (1 << 3)  /* `arguments` allowed (normal fns; arrows clear it) */
+typedef struct JSAOTShape {
+    int arg_count, var_count, defined_arg_count, stack_size;
+    int var_ref_count, closure_var_count, cpool_count;
+    int flags;                             /* JS_AOT_SHAPE_* */
+} JSAOTShape;
+JS_EXTERN void JS_AOTGetShape(const JSFunctionBytecode *b, JSAOTShape *shape);
+/* Function name for logs (caller frees with JS_FreeCString); NULL if anonymous. */
+JS_EXTERN const char *JS_AOTGetFuncName(JSContext *ctx, const JSFunctionBytecode *b);
 
 /* only exported for os.Worker() */
 JS_EXTERN JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);

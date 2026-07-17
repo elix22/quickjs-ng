@@ -63641,11 +63641,744 @@ const uint8_t *JS_AOTGetBytecode(const JSFunctionBytecode *b, int *plen)
     return b->byte_code_buf;
 }
 
-void JS_AOTGetShape(const JSFunctionBytecode *b, int *parg_count,
-                    int *pvar_count, int *pstack_size, int *pcpool_count)
+void JS_AOTGetShape(const JSFunctionBytecode *b, JSAOTShape *shape)
 {
-    if (parg_count)   *parg_count = b->arg_count;
-    if (pvar_count)   *pvar_count = b->var_count;
-    if (pstack_size)  *pstack_size = b->stack_size;
-    if (pcpool_count) *pcpool_count = b->cpool_count;
+    shape->arg_count = b->arg_count;
+    shape->var_count = b->var_count;
+    shape->defined_arg_count = b->defined_arg_count;
+    shape->stack_size = b->stack_size;
+    shape->var_ref_count = b->var_ref_count;
+    shape->closure_var_count = b->closure_var_count;
+    shape->cpool_count = b->cpool_count;
+    shape->flags = (b->is_strict_mode ? JS_AOT_SHAPE_STRICT : 0) |
+                   ((b->func_kind << 1) & JS_AOT_SHAPE_FUNC_KIND) |
+                   (b->arguments_allowed ? JS_AOT_SHAPE_ARGUMENTS : 0);
 }
+
+const char *JS_AOTGetFuncName(JSContext *ctx, const JSFunctionBytecode *b)
+{
+    if (b->func_name == JS_ATOM_NULL)
+        return NULL;
+    return JS_AtomToCString(ctx, b->func_name);
+}
+
+/* ------------------------------------------------------------------------------------
+   TNR AOT twin runtime support (fork patch; plan §5.3) — the JS_AOT* surface that
+   tnr-aotc-generated C functions ("twins") link against. Every JS_AOTOp* body is
+   the corresponding interpreter case body, verbatim where possible: same fast
+   paths, same slow calls, same refcount discipline, same sf->cur_pc updates.
+   When editing an interpreter case, mirror the change here — the differential
+   harness (AOT vs TNR_NO_AOT=1) is the guard.
+ */
+#include "quickjs-aot.h"
+
+_Static_assert(sizeof(JSStackFrame) <= JS_AOT_FRAME_SIZE,
+               "bump JS_AOT_FRAME_SIZE in quickjs-aot.h");
+
+JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
+                            JSFunctionBytecode *b, JSValueConst func_obj,
+                            JSValueConst this_obj, int argc, JSValueConst *argv,
+                            JSValue *locals, JSVarRef **frame_var_refs,
+                            JSValue **parg_buf)
+{
+    JSRuntime *rt = caller_ctx->rt;
+    JSStackFrame *sf = (JSStackFrame *)frame;
+    int i, n;
+    (void)this_obj;
+    /* twin locals live on ITS C stack; mirror the interpreter's alloca guard with
+       the same size accounting so recursion limits behave identically */
+    size_t alloca_size = sizeof(JSValue) * ((size_t)b->arg_count + b->var_count +
+                                            b->stack_size) +
+                         sizeof(JSVarRef *) * b->var_ref_count;
+    if (js_check_stack_overflow(rt, alloca_size)) {
+        JS_ThrowStackOverflow(caller_ctx);
+        return NULL;
+    }
+    sf->is_strict_mode = b->is_strict_mode;
+    sf->cur_func = unsafe_unconst(func_obj);
+    /* interpreter behavior, kept exactly: alias the caller's argv when every
+       declared arg is present (put_arg then writes caller stack slots — the
+       caller frees them); copy into the twin's locals only when argc falls
+       short. The dispatch hook excludes JS_CALL_FLAG_COPY_ARGV calls, so
+       aliasing is always legal here. */
+    if (argc >= b->arg_count) {
+        sf->arg_buf = (JSValue *)argv;
+        sf->arg_count = argc;
+    } else {
+        n = min_int(argc, b->arg_count);
+        for (i = 0; i < n; i++)
+            locals[i] = js_dup(argv[i]);
+        for (; i < b->arg_count; i++)
+            locals[i] = JS_UNDEFINED;
+        sf->arg_count = b->arg_count;
+        sf->arg_buf = locals;
+    }
+    *parg_buf = sf->arg_buf;
+    sf->var_buf = locals + b->arg_count;
+    for (i = 0; i < b->var_count; i++)
+        sf->var_buf[i] = JS_UNDEFINED;
+    sf->var_refs = frame_var_refs;
+    sf->var_ref_count = b->var_ref_count;
+    for (i = 0; i < b->var_ref_count; i++)
+        frame_var_refs[i] = NULL;
+    sf->cur_pc = NULL;
+    sf->cur_sp = NULL;
+    sf->prev_frame = rt->current_stack_frame;
+    rt->current_stack_frame = sf;
+    return b->realm;
+}
+
+void JS_AOTFrameLeave(JSContext *ctx, JSAOTFrame *frame, JSFunctionBytecode *b,
+                      JSValue *locals, JSValue *sp)
+{
+    JSStackFrame *sf = (JSStackFrame *)frame;
+    JSRuntime *rt = ctx->rt;
+    JSValue *pval;
+    /* interpreter 'done:' order, kept verbatim: close_var_ref DUPS the live
+       stack value, so closing must happen BEFORE the frees. When args were
+       aliased from the caller (arg_buf != locals) they are the caller's to
+       free — start at var_buf, exactly like the interpreter's non-allocated
+       arg case. */
+    if (unlikely(b->var_ref_count != 0))
+        close_var_refs(rt, sf);
+    pval = (sf->arg_buf == locals) ? locals : locals + b->arg_count;
+    for (; pval < sp; pval++)
+        JS_FreeValue(ctx, *pval);
+    rt->current_stack_frame = sf->prev_frame;
+}
+
+uint8_t **JS_AOTFramePCSlot(JSAOTFrame *frame)
+{
+    return &((JSStackFrame *)frame)->cur_pc;
+}
+
+int JS_AOTPoll(JSContext *ctx)
+{
+    return js_poll_interrupts(ctx) ? -1 : 0;
+}
+
+JSValue JS_AOTCpool(JSFunctionBytecode *b, int idx)
+{
+    return b->cpool[idx];
+}
+
+JSValue JS_AOTVarRefGet(JSVarRef **var_refs, int idx)
+{
+    return js_dup(*var_refs[idx]->pvalue);
+}
+
+void JS_AOTVarRefPut(JSContext *ctx, JSVarRef **var_refs, int idx, JSValue v)
+{
+    set_value(ctx, var_refs[idx]->pvalue, v);
+}
+
+#define TNR_SF ((JSStackFrame *)frame)
+
+int JS_AOTOpAddSlow(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                    const uint8_t *next_pc)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    if (js_add_slow(ctx, *psp))
+        return -1;
+    (*psp)--;
+    return 0;
+}
+
+int JS_AOTOpArithSlow(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                      const uint8_t *next_pc, int op)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    if (js_binary_arith_slow(ctx, *psp, op))
+        return -1;
+    (*psp)--;
+    return 0;
+}
+
+int JS_AOTOpUnarySlow(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                      const uint8_t *next_pc, int op)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    return js_unary_arith_slow(ctx, *psp, op) ? -1 : 0;
+}
+
+int JS_AOTOpNotSlow(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                    const uint8_t *next_pc)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    return js_not_slow(ctx, *psp) ? -1 : 0;
+}
+
+int JS_AOTOpLogicSlow(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                      const uint8_t *next_pc, int op)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    if (js_binary_logic_slow(ctx, *psp, op))
+        return -1;
+    (*psp)--;
+    return 0;
+}
+
+int JS_AOTOpShrSlow(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                    const uint8_t *next_pc)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    if (js_shr_slow(ctx, *psp))
+        return -1;
+    (*psp)--;
+    return 0;
+}
+
+int JS_AOTOpCmpSlow(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                    const uint8_t *next_pc, int op)
+{
+    int ret;
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    switch (op) {
+    case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+        ret = js_relational_slow(ctx, *psp, op);
+        break;
+    case OP_eq:
+        ret = js_eq_slow(ctx, *psp, 0);
+        break;
+    case OP_neq:
+        ret = js_eq_slow(ctx, *psp, 1);
+        break;
+    case OP_strict_eq:
+        ret = js_strict_eq_slow(ctx, *psp, 0);
+        break;
+    case OP_strict_neq:
+        ret = js_strict_eq_slow(ctx, *psp, 1);
+        break;
+    default:
+        JS_ThrowInternalError(ctx, "AOT: bad cmp op %d", op);
+        return -1;
+    }
+    if (ret)
+        return -1;
+    (*psp)--;
+    return 0;
+}
+
+int JS_AOTOpPostIncDec(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                       const uint8_t *next_pc, int op)
+{
+    JSValue *sp = *psp;
+    JSValue op1 = sp[-1];
+    if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+        int val = JS_VALUE_GET_INT(op1);
+        if (op == OP_post_inc) {
+            if (unlikely(val == INT32_MAX))
+                goto slow;
+            sp[0] = js_int32(val + 1);
+        } else {
+            if (unlikely(val == INT32_MIN))
+                goto slow;
+            sp[0] = js_int32(val - 1);
+        }
+    } else {
+    slow:
+        TNR_SF->cur_pc = (uint8_t *)next_pc;
+        if (js_post_inc_slow(ctx, sp, op))
+            return -1;
+    }
+    *psp = sp + 1;
+    return 0;
+}
+
+int JS_AOTOpIncDecLoc(JSContext *ctx, JSAOTFrame *frame, JSValue *var_buf,
+                      int idx, const uint8_t *next_pc, int op)
+{
+    JSValue op1 = var_buf[idx];
+    if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+        int val = JS_VALUE_GET_INT(op1);
+        if (op == OP_inc_loc) {
+            if (unlikely(val == INT32_MAX))
+                goto slow;
+            var_buf[idx] = js_int32(val + 1);
+        } else {
+            if (unlikely(val == INT32_MIN))
+                goto slow;
+            var_buf[idx] = js_int32(val - 1);
+        }
+    } else {
+    slow:
+        TNR_SF->cur_pc = (uint8_t *)next_pc;
+        /* must duplicate otherwise the variable value may be destroyed before
+           JS code accesses it (interpreter comment, kept verbatim) */
+        op1 = js_dup(op1);
+        if (js_unary_arith_slow(ctx, &op1 + 1, op == OP_inc_loc ? OP_inc : OP_dec))
+            return -1;
+        set_value(ctx, &var_buf[idx], op1);
+    }
+    return 0;
+}
+
+int JS_AOTOpAddLoc(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                   JSValue *var_buf, int idx, const uint8_t *next_pc)
+{
+    JSValue *sp = *psp;
+    JSValue *pv = &var_buf[idx];
+    if (likely(JS_VALUE_IS_BOTH_INT(*pv, sp[-1]))) {
+        int64_t r = (int64_t)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_INT(sp[-1]);
+        if (unlikely((int)r != r))
+            *pv = __JS_NewFloat64((double)r);
+        else
+            *pv = js_int32((int)r);
+        sp--;
+    } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
+        JSValue op1 = sp[-1];
+        sp--;
+        TNR_SF->cur_pc = (uint8_t *)next_pc;
+        op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
+        if (JS_IsException(op1)) {
+            *psp = sp;
+            return -1;
+        }
+        op1 = JS_ConcatString(ctx, js_dup(*pv), op1);
+        if (JS_IsException(op1)) {
+            *psp = sp;
+            return -1;
+        }
+        set_value(ctx, pv, op1);
+    } else {
+        JSValue ops[2];
+        /* in case of exception, js_add_slow frees ops[0] and ops[1], so we must
+           duplicate *pv (interpreter comment, kept verbatim) */
+        TNR_SF->cur_pc = (uint8_t *)next_pc;
+        ops[0] = js_dup(*pv);
+        ops[1] = sp[-1];
+        sp--;
+        if (js_add_slow(ctx, ops + 2)) {
+            *psp = sp;
+            return -1;
+        }
+        set_value(ctx, pv, ops[0]);
+    }
+    *psp = sp;
+    return 0;
+}
+
+int JS_AOTOpGetField(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                     const uint8_t *next_pc, JSAtom atom)
+{
+    JSValue *sp = *psp;
+    JSValue val, obj;
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    obj = sp[-1];
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        for (;;) {
+            prs = find_own_property(&pr, p, atom);
+            if (prs) {
+                if (unlikely(prs->flags & JS_PROP_TMASK))
+                    goto slow_path;
+                val = js_dup(pr->u.value);
+                break;
+            }
+            if (unlikely(p->is_exotic)) {
+                obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                goto slow_path;
+            }
+            p = p->shape->proto;
+            if (!p) {
+                val = JS_UNDEFINED;
+                break;
+            }
+        }
+    } else {
+    slow_path:
+        TNR_SF->cur_pc = (uint8_t *)next_pc;
+        val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+        if (unlikely(JS_IsException(val)))
+            return -1;
+    }
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = val;
+    return 0;
+}
+
+int JS_AOTOpGetField2(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                      const uint8_t *next_pc, JSAtom atom)
+{
+    JSValue *sp = *psp;
+    JSValue val, obj;
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    obj = sp[-1];
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        for (;;) {
+            prs = find_own_property(&pr, p, atom);
+            if (prs) {
+                if (unlikely(prs->flags & JS_PROP_TMASK))
+                    goto slow_path;
+                val = js_dup(pr->u.value);
+                break;
+            }
+            if (unlikely(p->is_exotic)) {
+                obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                goto slow_path;
+            }
+            p = p->shape->proto;
+            if (!p) {
+                val = JS_UNDEFINED;
+                break;
+            }
+        }
+    } else {
+    slow_path:
+        TNR_SF->cur_pc = (uint8_t *)next_pc;
+        val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+        if (unlikely(JS_IsException(val)))
+            return -1;
+    }
+    *sp++ = val;
+    *psp = sp;
+    return 0;
+}
+
+int JS_AOTOpPutField(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                     const uint8_t *next_pc, JSAtom atom)
+{
+    JSValue *sp = *psp;
+    JSValue obj = sp[-2];
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    int ret;
+
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            goto slow_path;
+        if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                  JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+            set_value(ctx, &pr->u.value, sp[-1]);
+        } else {
+            goto slow_path;
+        }
+        JS_FreeValue(ctx, obj);
+        *psp = sp - 2;
+    } else {
+    slow_path:
+        TNR_SF->cur_pc = (uint8_t *)next_pc;
+        ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
+                                      JS_PROP_THROW_STRICT);
+        JS_FreeValue(ctx, obj);
+        *psp = sp - 2;
+        if (unlikely(ret < 0))
+            return -1;
+    }
+    return 0;
+}
+
+int JS_AOTOpGetArrayEl(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                       const uint8_t *next_pc)
+{
+    JSValue *sp = *psp;
+    JSValue val;
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+    JS_FreeValue(ctx, sp[-2]);
+    sp[-2] = val;
+    *psp = sp - 1;
+    return unlikely(JS_IsException(val)) ? -1 : 0;
+}
+
+int JS_AOTOpPutArrayEl(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                       const uint8_t *next_pc)
+{
+    JSValue *sp = *psp;
+    JSValue val = sp[-1];
+    uint32_t idx;
+    JSObject *p;
+    int ret;
+
+    if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
+        idx = JS_VALUE_GET_INT(sp[-2]);
+        if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
+            p = JS_VALUE_GET_OBJ(sp[-3]);
+            if (likely(p->class_id == JS_CLASS_ARRAY &&
+                       idx < (uint32_t)p->u.array.count)) {
+                set_value(ctx, &p->u.array.u.values[idx], val);
+                JS_FreeValue(ctx, sp[-3]);
+                *psp = sp - 3;
+                return 0;
+            }
+            if (likely(p->class_id == JS_CLASS_ARRAY &&
+                       idx == (uint32_t)p->u.array.count &&
+                       p->fast_array &&
+                       p->extensible &&
+                       p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
+                       ctx->std_array_prototype)) {
+                uint32_t array_len;
+                if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)) {
+                    uint32_t new_len = idx + 1;
+                    array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
+                    if (likely(new_len <= p->u.array.u1.size)) {
+                        p->u.array.u.values[idx] = val;
+                        p->u.array.count = new_len;
+                        if (new_len > array_len)
+                            p->prop[0].u.value = js_int32(new_len);
+                        JS_FreeValue(ctx, sp[-3]);
+                        *psp = sp - 3;
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
+    JS_FreeValue(ctx, sp[-3]);
+    *psp = sp - 3;
+    return unlikely(ret < 0) ? -1 : 0;
+}
+
+int JS_AOTOpGetVar(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                   const uint8_t *next_pc, JSAtom atom, int undef_ok)
+{
+    JSValue val;
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    val = JS_GetGlobalVar(ctx, atom, undef_ok);
+    if (unlikely(JS_IsException(val)))
+        return -1;
+    *(*psp)++ = val;
+    return 0;
+}
+
+int JS_AOTOpPutVar(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                   const uint8_t *next_pc, JSAtom atom, int is_init)
+{
+    int ret;
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    ret = JS_SetGlobalVar(ctx, atom, (*psp)[-1], is_init);
+    (*psp)--;
+    return unlikely(ret < 0) ? -1 : 0;
+}
+
+int JS_AOTOpCall(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                 const uint8_t *next_pc, int argc, int method)
+{
+    JSValue *sp = *psp;
+    JSValue *call_argv = sp - argc;
+    JSValue ret_val;
+    int i;
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    ret_val = JS_CallInternal(ctx, call_argv[-1],
+                              method ? call_argv[-2] : JS_UNDEFINED,
+                              JS_UNDEFINED, argc, vc(call_argv), 0);
+    if (unlikely(JS_IsException(ret_val)))
+        return -1;
+    for (i = -1 - method; i < argc; i++)
+        JS_FreeValue(ctx, call_argv[i]);
+    sp -= argc + 1 + method;
+    *sp++ = ret_val;
+    *psp = sp;
+    return 0;
+}
+
+int JS_AOTOpTailCall(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                     const uint8_t *next_pc, int argc, int method, JSValue *pret)
+{
+    JSValue *sp = *psp;
+    JSValue *call_argv = sp - argc;
+    JSValue ret_val;
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    ret_val = JS_CallInternal(ctx, call_argv[-1],
+                              method ? call_argv[-2] : JS_UNDEFINED,
+                              JS_UNDEFINED, argc, vc(call_argv), 0);
+    if (unlikely(JS_IsException(ret_val)))
+        return -1;
+    /* the interpreter jumps straight to done: the twin frees the whole live
+       stack (args included) on its way out, exactly like the interpreter's
+       exit loop over stack_buf..sp */
+    *pret = ret_val;
+    return 0;
+}
+
+int JS_AOTOpCallCtor(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                     const uint8_t *next_pc, int argc)
+{
+    /* stack: func, new_target, args... — pops argc+2, pushes the result */
+    JSValue *sp = *psp;
+    JSValue *call_argv = sp - argc;
+    JSValue ret_val;
+    int i;
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    ret_val = JS_CallConstructorInternal(ctx, call_argv[-2], call_argv[-1],
+                                         argc, vc(call_argv), 0);
+    if (unlikely(JS_IsException(ret_val)))
+        return -1;
+    for (i = -2; i < argc; i++)
+        JS_FreeValue(ctx, call_argv[i]);
+    sp -= argc + 2;
+    *sp++ = ret_val;
+    *psp = sp;
+    return 0;
+}
+
+int JS_AOTOpFClosure(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                     JSFunctionBytecode *b, int cpool_idx, JSVarRef **var_refs)
+{
+    JSValue *sp = *psp;
+    JSValue bfunc = js_dup(b->cpool[cpool_idx]);
+    *sp++ = js_closure(ctx, bfunc, var_refs, (JSStackFrame *)frame);
+    *psp = sp;
+    return unlikely(JS_IsException(sp[-1])) ? -1 : 0;
+}
+
+int JS_AOTOpPushThis(JSContext *ctx, JSValue **psp, JSValueConst this_obj,
+                     int is_strict)
+{
+    JSValue val;
+    if (!is_strict) {
+        uint32_t tag = JS_VALUE_GET_TAG(this_obj);
+        if (likely(tag == JS_TAG_OBJECT)) {
+            val = js_dup(this_obj);
+        } else if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+            val = js_dup(ctx->global_obj);
+        } else {
+            val = JS_ToObject(ctx, this_obj);
+            if (JS_IsException(val))
+                return -1;
+        }
+    } else {
+        val = js_dup(this_obj);
+    }
+    *(*psp)++ = val;
+    return 0;
+}
+
+int JS_AOTOpTypeof(JSContext *ctx, JSValue **psp)
+{
+    JSValue *sp = *psp;
+    JSValue op1 = sp[-1];
+    JSAtom atom = js_operator_typeof(ctx, op1);
+    JS_FreeValue(ctx, op1);
+    sp[-1] = JS_AtomToString(ctx, atom);
+    return 0;
+}
+
+int JS_AOTOpInstanceof(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                       const uint8_t *next_pc)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    if (js_operator_instanceof(ctx, *psp))
+        return -1;
+    (*psp)--;
+    return 0;
+}
+
+int JS_AOTOpIn(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+               const uint8_t *next_pc)
+{
+    TNR_SF->cur_pc = (uint8_t *)next_pc;
+    if (js_operator_in(ctx, *psp))
+        return -1;
+    (*psp)--;
+    return 0;
+}
+
+int JS_AOTOpObject(JSContext *ctx, JSValue **psp)
+{
+    JSValue v = JS_NewObject(ctx);
+    if (unlikely(JS_IsException(v)))
+        return -1;
+    *(*psp)++ = v;
+    return 0;
+}
+
+int JS_AOTOpDefineField(JSContext *ctx, JSValue **psp, JSAtom atom)
+{
+    JSValue *sp = *psp;
+    int ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
+                                     JS_PROP_C_W_E | JS_PROP_THROW);
+    *psp = sp - 1;
+    return unlikely(ret < 0) ? -1 : 0;
+}
+
+int JS_AOTOpToBoolFree(JSContext *ctx, JSValue v)
+{
+    return JS_ToBoolFree(ctx, v);
+}
+
+int JS_AOTThrowUninit(JSContext *ctx, JSFunctionBytecode *b, int idx, int is_ref)
+{
+    JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, is_ref != 0);
+    return -1;
+}
+
+int JS_AOTOpPutLocCheckInit(JSContext *ctx, JSValue **psp, JSValue *var_buf, int idx)
+{
+    if (unlikely(!JS_IsUninitialized(var_buf[idx]))) {
+        JS_ThrowReferenceError(ctx, "'this' can be initialized only once");
+        return -1;
+    }
+    set_value(ctx, &var_buf[idx], *--(*psp));
+    return 0;
+}
+
+int JS_AOTOpPutVarRefCheck(JSContext *ctx, JSValue **psp, JSFunctionBytecode *b,
+                           JSVarRef **var_refs, int idx, int is_init)
+{
+    bool uninit = JS_IsUninitialized(*var_refs[idx]->pvalue);
+    if (unlikely(is_init ? !uninit : uninit)) {
+        JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, true);
+        return -1;
+    }
+    set_value(ctx, var_refs[idx]->pvalue, *--(*psp));
+    return 0;
+}
+
+void JS_AOTOpCloseLoc(JSContext *ctx, JSAOTFrame *frame, JSFunctionBytecode *b, int idx)
+{
+    close_lexical_var(ctx, b, (JSStackFrame *)frame, idx);
+}
+
+int JS_AOTOpSetName(JSContext *ctx, JSValue **psp, JSAtom atom)
+{
+    return JS_DefineObjectName(ctx, (*psp)[-1], atom, JS_PROP_CONFIGURABLE) < 0 ? -1 : 0;
+}
+
+int JS_AOTOpArrayFrom(JSContext *ctx, JSValue **psp, int argc)
+{
+    /* JS_NewArrayFrom takes ownership of the argc values */
+    JSValue *sp = *psp;
+    JSValue ret = JS_NewArrayFrom(ctx, argc, sp - argc);
+    sp -= argc;
+    if (unlikely(JS_IsException(ret))) {
+        *psp = sp;
+        return -1;
+    }
+    *sp++ = ret;
+    *psp = sp;
+    return 0;
+}
+
+void JS_AOTOpTypeofIs(JSContext *ctx, JSValue **psp, int is_function)
+{
+    JSValue *sp = *psp;
+    JSAtom want = is_function ? JS_ATOM_function : JS_ATOM_undefined;
+    int r = js_operator_typeof(ctx, sp[-1]) == want;
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = r ? JS_TRUE : JS_FALSE;
+}
+
+#undef TNR_SF
+
+/* Twins can be compiled INSIDE this translation unit (cmake passes
+   TNR_AOT_GENERATED_C=<tnr-aotc --emit-c output>): every JS_AOTOp* helper above
+   is then a same-TU definition the optimizer inlines into the generated code —
+   the "unrolled interpreter" of plan §5.3 without exporting any internals.
+   Compiled standalone instead, the same generated file still links against the
+   extern helpers; it just pays a call per op. */
+#ifdef TNR_AOT_GENERATED_C
+#include TNR_AOT_GENERATED_C
+#endif
