@@ -1356,6 +1356,79 @@ static inline JSValue *js_aot_fld_slot(JSValueConst v, JSAtom atom,
     return &pr->u.value;
 }
 
+/* ---- v3.5d Math intrinsics (phase3 §14.4) ------------------------------------------
+   Entry guard: the global `Math` binding is pristine (not shadowed by a
+   let/const global, a plain own data prop of the global object) and the method
+   is the engine's own native — pointer-compared against the same-TU statics.
+   Pure reads, hoistable. The typed body then calls the SAME implementation
+   functions directly, so results are bit-identical to the interpreter path. */
+static inline int js_aot_math_check(JSContext *ctx, JSAtom math_atom,
+                                    JSAtom fn_atom, int kind)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    /* JS_GetGlobalVar consults global_var_obj first: a `let Math` shadows */
+    if (JS_VALUE_GET_TAG(ctx->global_var_obj) == JS_TAG_OBJECT &&
+        find_own_property1(JS_VALUE_GET_OBJ(ctx->global_var_obj), math_atom))
+        return 0;
+    p = JS_VALUE_GET_OBJ(ctx->global_obj);
+    prs = find_own_property(&pr, p, math_atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(pr->u.value);
+    prs = find_own_property(&pr, p, fn_atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(pr->u.value);
+    if (p->class_id != JS_CLASS_C_FUNCTION)
+        return 0;
+    switch (kind) {
+    case JS_AOT_MF_SQRT:
+        return p->u.cfunc.cproto == JS_CFUNC_f_f && p->u.cfunc.c_function.f_f == js_math_sqrt;
+    case JS_AOT_MF_ABS:
+        return p->u.cfunc.cproto == JS_CFUNC_f_f && p->u.cfunc.c_function.f_f == js_math_fabs;
+    case JS_AOT_MF_FLOOR:
+        return p->u.cfunc.cproto == JS_CFUNC_f_f && p->u.cfunc.c_function.f_f == js_math_floor;
+    case JS_AOT_MF_CEIL:
+        return p->u.cfunc.cproto == JS_CFUNC_f_f && p->u.cfunc.c_function.f_f == js_math_ceil;
+    case JS_AOT_MF_MIN:
+        return p->u.cfunc.cproto == JS_CFUNC_generic_magic &&
+               p->u.cfunc.c_function.generic_magic == js_math_min_max && p->u.cfunc.magic == 0;
+    case JS_AOT_MF_MAX:
+        return p->u.cfunc.cproto == JS_CFUNC_generic_magic &&
+               p->u.cfunc.c_function.generic_magic == js_math_min_max && p->u.cfunc.magic == 1;
+    }
+    return 0;
+}
+/* Body calls — the guarded natives themselves (f_f wrappers over libm). */
+static inline double js_aot_math1(int kind, double x)
+{
+    switch (kind) {
+    case JS_AOT_MF_SQRT: return js_math_sqrt(x);
+    case JS_AOT_MF_ABS:  return js_math_fabs(x);
+    case JS_AOT_MF_FLOOR: return js_math_floor(x);
+    default:             return js_math_ceil(x);
+    }
+}
+/* js_math_min_max's double arm, verbatim (NaN propagation; js_fmin/js_fmax
+   handle the -0/+0 ordering). The interpreter's int fast path returns an
+   int-tagged number instead — value-identical in JS. */
+static inline double js_aot_math2(int kind, double r, double a)
+{
+    if (!isnan(r)) {
+        if (isnan(a))
+            r = a;
+        else
+            r = kind == JS_AOT_MF_MAX ? js_fmax(r, a) : js_fmin(r, a);
+    }
+    return r;
+}
+
 /* Twins can be compiled INSIDE this translation unit (cmake passes
    TNR_AOT_GENERATED_C=<tnr-aotc --emit-c output>): every JS_AOTOp* helper above
    is then a same-TU definition the optimizer inlines into the generated code —

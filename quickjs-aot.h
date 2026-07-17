@@ -198,6 +198,18 @@ JS_EXTERN int JS_AOTThrowNonCtor(JSContext *ctx); /* OP_check_ctor; returns -1 *
    timing is observable — see the comment at the definition). */
 JS_EXTERN void JS_AOTExceptionBacktrace(JSContext *ctx, JSAOTFrame *frame);
 
+/* Math intrinsics recognized by typed regions (v3.5d). The kind is the contract
+   between tnr-aotc emission and the same-TU guard/dispatch helpers in
+   quickjs-aot.c (js_aot_math_check / js_aot_math1 / js_aot_math2). Only
+   functions whose inlined C is bit-identical to the engine's own path are
+   here: the f_f family calls the SAME static wrappers, min/max mirrors
+   js_math_min_max's double arm. pow/trig are deliberately absent (JS special
+   cases / platform libm divergence). */
+enum {
+    JS_AOT_MF_SQRT, JS_AOT_MF_ABS, JS_AOT_MF_FLOOR, JS_AOT_MF_CEIL,
+    JS_AOT_MF_MIN, JS_AOT_MF_MAX,
+};
+
 /* per-site inline caches (v2): opaque here; the generated file (compiled in-TU)
    defines the array and publishes it via tnr_aot_ic_table/count for reset.
    Engine calls JS_AOTResetICs before JS_FreeRuntime — cached shapes/holders
