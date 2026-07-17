@@ -193,6 +193,19 @@ JS_EXTERN int JS_AOTOpToBoolFree(JSContext *ctx, JSValue v); /* branch condition
 JS_EXTERN int JS_AOTThrowUninit(JSContext *ctx, JSFunctionBytecode *b, int idx,
                                 int is_ref);  /* always returns -1 */
 JS_EXTERN int JS_AOTThrowNonCtor(JSContext *ctx); /* OP_check_ctor; returns -1 */
+
+/* per-site inline caches (v2): opaque here; the generated file (compiled in-TU)
+   defines the array and publishes it via tnr_aot_ic_table/count for reset.
+   Engine calls JS_AOTResetICs before JS_FreeRuntime — cached shapes/holders
+   hold real references. */
+typedef struct JSAOTIC JSAOTIC;
+JS_EXTERN void JS_AOTResetICs(JSRuntime *rt, JSAOTIC *ics, size_t count);
+JS_EXTERN int JS_AOTOpGetFieldIC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                                 const uint8_t *next_pc, JSAtom atom, JSAOTIC *ic);
+JS_EXTERN int JS_AOTOpGetField2IC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                                  const uint8_t *next_pc, JSAtom atom, JSAOTIC *ic);
+JS_EXTERN int JS_AOTOpPutFieldIC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                                 const uint8_t *next_pc, JSAtom atom, JSAOTIC *ic);
 static inline int JS_AOTOpGetLocCheck(JSContext *ctx, JSValue **psp, JSFunctionBytecode *b,
                                       JSValue *var_buf, int idx) {
     if (JS_VALUE_GET_TAG(var_buf[idx]) == JS_TAG_UNINITIALIZED)

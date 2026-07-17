@@ -754,6 +754,30 @@ int JS_AOTOpPutVar(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
     return unlikely(ret < 0) ? -1 : 0;
 }
 
+/* Direct twin->twin dispatch (v2): when the callee is a plain bytecode
+   function that HAS a twin, skip JS_CallInternal's whole prologue (tag/class
+   walk, arg-alloc decision, dispatch-table entry) and invoke the twin function
+   pointer. Semantics preserved: the interrupt poll happens exactly where
+   JS_CallInternal would poll, and everything else IS the twin's FrameEnter. */
+static inline JSValue tnr_aot_call_dispatch(JSContext *ctx, JSValueConst func_obj,
+                                                  JSValueConst this_obj, int argc,
+                                                  JSValueConst *argv)
+{
+    if (likely(JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT)) {
+        JSObject *fp = JS_VALUE_GET_OBJ(func_obj);
+        if (fp->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSFunctionBytecode *cb = fp->u.func.function_bytecode;
+            if (cb->aot_func != NULL) {
+                if (unlikely(js_poll_interrupts(ctx)))
+                    return JS_EXCEPTION;
+                return cb->aot_func(ctx, func_obj, this_obj, JS_UNDEFINED,
+                                    argc, argv, cb, fp->u.func.var_refs);
+            }
+        }
+    }
+    return JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED, argc, argv, 0);
+}
+
 int JS_AOTOpCall(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
                  const uint8_t *next_pc, int argc, int method)
 {
@@ -762,9 +786,9 @@ int JS_AOTOpCall(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
     JSValue ret_val;
     int i;
     TNR_SF->cur_pc = (uint8_t *)next_pc;
-    ret_val = JS_CallInternal(ctx, call_argv[-1],
-                              method ? call_argv[-2] : JS_UNDEFINED,
-                              JS_UNDEFINED, argc, vc(call_argv), 0);
+    ret_val = tnr_aot_call_dispatch(ctx, call_argv[-1],
+                                    method ? call_argv[-2] : JS_UNDEFINED,
+                                    argc, vc(call_argv));
     if (unlikely(JS_IsException(ret_val)))
         return -1;
     for (i = -1 - method; i < argc; i++)
@@ -782,9 +806,9 @@ int JS_AOTOpTailCall(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
     JSValue *call_argv = sp - argc;
     JSValue ret_val;
     TNR_SF->cur_pc = (uint8_t *)next_pc;
-    ret_val = JS_CallInternal(ctx, call_argv[-1],
-                              method ? call_argv[-2] : JS_UNDEFINED,
-                              JS_UNDEFINED, argc, vc(call_argv), 0);
+    ret_val = tnr_aot_call_dispatch(ctx, call_argv[-1],
+                                    method ? call_argv[-2] : JS_UNDEFINED,
+                                    argc, vc(call_argv));
     if (unlikely(JS_IsException(ret_val)))
         return -1;
     /* the interpreter jumps straight to done: the twin frees the whole live
@@ -904,6 +928,216 @@ int JS_AOTThrowUninit(JSContext *ctx, JSFunctionBytecode *b, int idx, int is_ref
 {
     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, is_ref != 0);
     return -1;
+}
+
+
+/* ---- per-site inline caches (v2) ----------------------------------------------------
+   One JSAOTIC per get_field/get_field2/put_field SITE in generated code (the
+   generated file defines the array and publishes it through tnr_aot_ic_table).
+   Twin execution is single-threaded by construction (workers never load .qbc),
+   so no atomics.
+
+   Correctness model — a hit must be right even with quickjs's in-place shape
+   mutation (unique shapes append properties without changing the pointer):
+   * OWN hit: receiver shape ptr match + shape->prop[idx].atom == atom +
+     value-prop flags. In-place APPEND keeps idx/atom stable; DELETE compaction
+     moves props but then the atom check misses. Safe for unique shapes too.
+   * PROTO hit (method loads): additionally requires the RECEIVER shape to be
+     SHARED (is_hashed) — a unique receiver could gain a shadowing property
+     in place without changing its shape pointer. Shared shapes change pointer
+     on every own-layout change, and shape identity pins sh->proto, so the
+     holder (the direct proto) is pinned too; the holder's own layout is
+     guarded by its shape ptr + atom recheck. Only depth-1 holders are cached —
+     deeper chains would need per-link guards.
+   * Cached shape/holder pointers hold REAL references (js_dup_shape / js_dup),
+     released on replace and at JS_AOTResetICs (engine dispose) — no ABA.
+ */
+struct JSAOTIC {
+    JSShape *rshape;    /* receiver shape guard (ref held); NULL = empty */
+    JSShape *hshape;    /* proto hit: holder shape guard (ref held); NULL = own hit */
+    JSObject *holder;   /* proto hit: the holder object (ref held) */
+    uint32_t idx;       /* property index in the holder's shape/prop array */
+};
+
+void JS_AOTResetICs(JSRuntime *rt, JSAOTIC *ics, size_t count)
+{
+    size_t i;
+    for (i = 0; i < count; i++) {
+        if (ics[i].rshape)
+            js_free_shape(rt, ics[i].rshape);
+        if (ics[i].hshape)
+            js_free_shape(rt, ics[i].hshape);
+        if (ics[i].holder)
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, ics[i].holder));
+        memset(&ics[i], 0, sizeof ics[i]);
+    }
+}
+
+static inline int tnr_aot_ic_get_hit(JSContext *ctx, JSAOTIC *ic, JSObject *p,
+                                           JSAtom atom, JSValue *pval)
+{
+    if (p->shape == ic->rshape) {
+        JSObject *h = ic->holder ? ic->holder : p;
+        JSShape *hsh = h->shape;
+        if (ic->hshape == NULL || hsh == ic->hshape) {
+            JSShapeProperty *prs = &hsh->prop[ic->idx];
+            if (prs->atom == atom && !(prs->flags & JS_PROP_TMASK)) {
+                *pval = js_dup(h->prop[ic->idx].u.value);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void tnr_aot_ic_clear(JSContext *ctx, JSAOTIC *ic)
+{
+    if (ic->rshape) js_free_shape(ctx->rt, ic->rshape);
+    if (ic->hshape) js_free_shape(ctx->rt, ic->hshape);
+    if (ic->holder) JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, ic->holder));
+    memset(ic, 0, sizeof *ic);
+}
+
+static void tnr_aot_ic_fill(JSContext *ctx, JSAOTIC *ic, JSObject *receiver,
+                            JSObject *holder, JSShapeProperty *prs, JSProperty *pr)
+{
+    /* cache only plain value props; proto hits additionally need a SHARED
+       receiver shape (see the correctness model above) */
+    uint32_t idx = (uint32_t)(pr - holder->prop);
+    if (prs->flags & JS_PROP_TMASK)
+        return;
+    if (holder != receiver && !receiver->shape->is_hashed)
+        return;
+    tnr_aot_ic_clear(ctx, ic);
+    ic->rshape = js_dup_shape(receiver->shape);
+    ic->idx = idx;
+    if (holder != receiver) {
+        ic->hshape = js_dup_shape(holder->shape);
+        ic->holder = holder;
+        js_dup(JS_MKPTR(JS_TAG_OBJECT, holder));
+    }
+}
+
+/* get_field with a cache site: IC hit -> dup value; miss -> the interpreter
+   case body, filling the cache when the property resolves to a cacheable slot
+   at depth 0 or 1. keep_obj distinguishes OP_get_field2 (push) from
+   OP_get_field (replace). */
+static inline int tnr_aot_get_field_ic(JSContext *ctx, JSAOTFrame *frame,
+                                             JSValue **psp, const uint8_t *next_pc,
+                                             JSAtom atom, JSAOTIC *ic, int keep_obj)
+{
+    JSValue *sp = *psp;
+    JSValue val, obj;
+    JSObject *p, *receiver;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    int depth = 0;
+
+    obj = sp[-1];
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = receiver = JS_VALUE_GET_OBJ(obj);
+        if (tnr_aot_ic_get_hit(ctx, ic, p, atom, &val))
+            goto have_val;
+        for (;;) {
+            prs = find_own_property(&pr, p, atom);
+            if (prs) {
+                if (unlikely(prs->flags & JS_PROP_TMASK))
+                    goto slow_path;
+                if (depth <= 1)
+                    tnr_aot_ic_fill(ctx, ic, receiver, p, prs, pr);
+                val = js_dup(pr->u.value);
+                break;
+            }
+            if (unlikely(p->is_exotic)) {
+                obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                goto slow_path;
+            }
+            p = p->shape->proto;
+            if (!p) {
+                val = JS_UNDEFINED;
+                break;
+            }
+            depth++;
+        }
+    } else {
+    slow_path:
+        ((JSStackFrame *)frame)->cur_pc = (uint8_t *)next_pc;
+        val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+        if (unlikely(JS_IsException(val)))
+            return -1;
+    }
+have_val:
+    if (keep_obj) {
+        *sp++ = val;
+        *psp = sp;
+    } else {
+        JS_FreeValue(ctx, sp[-1]);
+        sp[-1] = val;
+    }
+    return 0;
+}
+
+int JS_AOTOpGetFieldIC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                       const uint8_t *next_pc, JSAtom atom, JSAOTIC *ic)
+{
+    return tnr_aot_get_field_ic(ctx, frame, psp, next_pc, atom, ic, 0);
+}
+
+int JS_AOTOpGetField2IC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                        const uint8_t *next_pc, JSAtom atom, JSAOTIC *ic)
+{
+    return tnr_aot_get_field_ic(ctx, frame, psp, next_pc, atom, ic, 1);
+}
+
+/* put_field with a cache site: only OWN writable plain slots are cached. */
+int JS_AOTOpPutFieldIC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
+                       const uint8_t *next_pc, JSAtom atom, JSAOTIC *ic)
+{
+    JSValue *sp = *psp;
+    JSValue obj = sp[-2];
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    int ret;
+
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        /* IC hit: own, writable, plain value */
+        if (p->shape == ic->rshape && ic->hshape == NULL) {
+            prs = &p->shape->prop[ic->idx];
+            if (prs->atom == atom &&
+                (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) ==
+                    JS_PROP_WRITABLE) {
+                set_value(ctx, &p->prop[ic->idx].u.value, sp[-1]);
+                JS_FreeValue(ctx, obj);
+                *psp = sp - 2;
+                return 0;
+            }
+        }
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            goto slow_path;
+        if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                  JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+            if (!(prs->flags & JS_PROP_TMASK))
+                tnr_aot_ic_fill(ctx, ic, p, p, prs, pr);
+            set_value(ctx, &pr->u.value, sp[-1]);
+        } else {
+            goto slow_path;
+        }
+        JS_FreeValue(ctx, obj);
+        *psp = sp - 2;
+    } else {
+    slow_path:
+        ((JSStackFrame *)frame)->cur_pc = (uint8_t *)next_pc;
+        ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
+                                      JS_PROP_THROW_STRICT);
+        JS_FreeValue(ctx, obj);
+        *psp = sp - 2;
+        if (unlikely(ret < 0))
+            return -1;
+    }
+    return 0;
 }
 
 int JS_AOTThrowNonCtor(JSContext *ctx)
