@@ -1307,6 +1307,38 @@ static inline void js_aot_el_putd(JSContext *ctx, JSValue arr, uint32_t idx, dou
     *pe = js_aot_float64(d);
     JS_FreeValue(ctx, old);
 }
+/* Entry guard for NUMERIC-FIELD regions (v3.4): `v` is a plain object
+   (JS_CLASS_OBJECT — no exotic get/set behavior) with an own DATA property
+   `atom` (not getter/varref/autoinit). Returns the property slot, NULL = deopt.
+     need_num:   the region reads the field before writing it, so the current
+                 value must already be numeric (the body unboxes check-free);
+     need_write: the region stores to it, so it must be writable (a frozen
+                 field takes the boxed path for the spec TypeError).
+   The returned pointer stays valid for the whole region: the typed body never
+   ADDS properties (the only thing that reallocates p->prop / mutates the
+   shape), field stores only replace the value in place, and quickjs's GC does
+   not move objects. Reads through the slot see in-region stores immediately,
+   which is what makes aliased references (this === arg) correct. */
+static inline JSValue *js_aot_fld_slot(JSValueConst v, JSAtom atom,
+                                       int need_num, int need_write)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id != JS_CLASS_OBJECT)
+        return NULL;
+    prs = find_own_property(&pr, p, atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return NULL;
+    if (need_write && !(prs->flags & JS_PROP_WRITABLE))
+        return NULL;
+    if (need_num && !JS_AOT_IS_NUM(pr->u.value))
+        return NULL;
+    return &pr->u.value;
+}
 
 /* Twins can be compiled INSIDE this translation unit (cmake passes
    TNR_AOT_GENERATED_C=<tnr-aotc --emit-c output>): every JS_AOTOp* helper above
