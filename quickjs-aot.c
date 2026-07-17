@@ -1253,6 +1253,61 @@ int JS_AOTOpToPropKey(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
 
 #undef TNR_SF
 
+/* ---- v3 typed-region helpers (phase3-aot-v3-typed-ir-plan.md §5/§6.2) --------------
+   Support for the UNBOXED double regions tnr-aotc emits: every type/fast-array
+   check hoists to REGION ENTRY (before any observable effect); the body then runs
+   on C doubles with zero checks; a failed entry guard jumps to the boxed
+   re-emission of the same ops. All static inline — twins compile in this TU and
+   the optimizer folds these into straight-line loads/stores/fp ops. */
+
+/* Entry guard: plain fast Array with count > max_idx (every index the region
+   touches, load or store, is <= max_idx — stores never grow the array). */
+static inline int js_aot_arr_fast(JSValue v, uint32_t max_idx)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(v);
+    return p->class_id == JS_CLASS_ARRAY && p->fast_array &&
+           (uint32_t)p->u.array.count > max_idx;
+}
+/* Entry guard: element at a const load index is numeric (int|float tag). */
+static inline int js_aot_el_isnum(JSValue arr, uint32_t idx)
+{
+    JSValue e = JS_VALUE_GET_OBJ(arr)->u.array.u.values[idx];
+    return JS_AOT_IS_NUM(e);
+}
+/* Body load, UNCHECKED — legal only after arr_fast + el_isnum entry guards. */
+static inline double js_aot_el_getd(JSValue arr, uint32_t idx)
+{
+    JSValue e = JS_VALUE_GET_OBJ(arr)->u.array.u.values[idx];
+    return JS_AOT_NUM(e);
+}
+/* Variable-index body load, CHECKED (bounds + numeric). Only emitted at
+   pre-store positions, where a failure may still restart the region boxed. */
+static inline int js_aot_el_getd_chk(JSValue arr, double didx, double *out)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(arr);
+    uint32_t idx = (uint32_t)didx;
+    JSValue e;
+    if ((double)idx != didx || idx >= (uint32_t)p->u.array.count)
+        return 0;
+    e = p->u.array.u.values[idx];
+    if (!JS_AOT_IS_NUM(e))
+        return 0;
+    *out = JS_AOT_NUM(e);
+    return 1;
+}
+/* Body store, UNCHECKED — legal only after arr_fast(arr, idx) at entry.
+   set_value semantics (free the displaced element); cannot throw. */
+static inline void js_aot_el_putd(JSContext *ctx, JSValue arr, uint32_t idx, double d)
+{
+    JSValue *pe = &JS_VALUE_GET_OBJ(arr)->u.array.u.values[idx];
+    JSValue old = *pe;
+    *pe = js_aot_float64(d);
+    JS_FreeValue(ctx, old);
+}
+
 /* Twins can be compiled INSIDE this translation unit (cmake passes
    TNR_AOT_GENERATED_C=<tnr-aotc --emit-c output>): every JS_AOTOp* helper above
    is then a same-TU definition the optimizer inlines into the generated code —
