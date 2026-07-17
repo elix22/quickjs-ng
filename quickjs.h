@@ -1251,7 +1251,8 @@ JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
 typedef struct JSFunctionBytecode JSFunctionBytecode; /* opaque to embedders */
 typedef struct JSVarRef JSVarRef;                     /* opaque to embedders */
 typedef JSValue (*JSAOTFunc)(JSContext *ctx, JSValueConst func_obj,
-                             JSValueConst this_val, int argc, JSValueConst *argv,
+                             JSValueConst this_val, JSValueConst new_target,
+                             int argc, JSValueConst *argv,
                              JSFunctionBytecode *b, JSVarRef **var_refs);
 typedef struct JSAOTEntry {
     uint64_t fn_hash; /* JS_AOTFunctionHash of the target function */
@@ -1281,6 +1282,7 @@ JS_EXTERN const uint8_t *JS_AOTGetBytecode(const JSFunctionBytecode *b, int *ple
 #define JS_AOT_SHAPE_STRICT      (1 << 0)
 #define JS_AOT_SHAPE_FUNC_KIND   (3 << 1)  /* JSFunctionKindEnum << 1; 0 = normal */
 #define JS_AOT_SHAPE_ARGUMENTS   (1 << 3)  /* `arguments` allowed (normal fns; arrows clear it) */
+#define JS_AOT_SHAPE_DERIVED_CTOR (1 << 4) /* derived class constructor (super) */
 typedef struct JSAOTShape {
     int arg_count, var_count, defined_arg_count, stack_size;
     int var_ref_count, closure_var_count, cpool_count;

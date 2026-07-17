@@ -17634,13 +17634,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     /* TNR AOT (fork patch, plan §5.4): a function with a generated C twin
        dispatches to it — one branch on the hot path, interpreter untouched
-       otherwise. Plain calls only: constructor calls need new_target/prototype
-       handling and generators resume mid-frame; both always interpret (twins
-       are never generated for them in v1 anyway — belt and braces). */
+       otherwise. Constructor calls dispatch too (v2): for non-derived ctors
+       JS_CallConstructorInternal has already created `this` and handles the
+       return-object-or-this selection; derived ctors carry super opcodes the
+       translator rejects, so they never have twins. Generators resume
+       mid-frame and COPY_ARGV callers own const argv (twins ALIAS argv when
+       argc >= arg_count) — both must always interpret. */
     if (unlikely(b->aot_func != NULL) &&
-        !(flags & (JS_CALL_FLAG_CONSTRUCTOR | JS_CALL_FLAG_GENERATOR))) {
-        return b->aot_func(caller_ctx, func_obj, this_obj, argc, argv, b,
-                           p->u.func.var_refs);
+        !(flags & (JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_COPY_ARGV))) {
+        return b->aot_func(caller_ctx, func_obj, this_obj, new_target, argc,
+                           argv, b, p->u.func.var_refs);
     }
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {

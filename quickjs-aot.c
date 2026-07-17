@@ -225,7 +225,8 @@ void JS_AOTGetShape(const JSFunctionBytecode *b, JSAOTShape *shape)
     shape->cpool_count = b->cpool_count;
     shape->flags = (b->is_strict_mode ? JS_AOT_SHAPE_STRICT : 0) |
                    ((b->func_kind << 1) & JS_AOT_SHAPE_FUNC_KIND) |
-                   (b->arguments_allowed ? JS_AOT_SHAPE_ARGUMENTS : 0);
+                   (b->arguments_allowed ? JS_AOT_SHAPE_ARGUMENTS : 0) |
+                   (b->is_derived_class_constructor ? JS_AOT_SHAPE_DERIVED_CTOR : 0);
 }
 
 const char *JS_AOTGetFuncName(JSContext *ctx, const JSFunctionBytecode *b)
@@ -902,6 +903,12 @@ int JS_AOTOpToBoolFree(JSContext *ctx, JSValue v)
 int JS_AOTThrowUninit(JSContext *ctx, JSFunctionBytecode *b, int idx, int is_ref)
 {
     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, is_ref != 0);
+    return -1;
+}
+
+int JS_AOTThrowNonCtor(JSContext *ctx)
+{
+    JS_ThrowTypeError(ctx, "class constructors must be invoked with 'new'");
     return -1;
 }
 

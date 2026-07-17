@@ -192,6 +192,7 @@ JS_EXTERN int JS_AOTOpToBoolFree(JSContext *ctx, JSValue v); /* branch condition
    arms are inline here; only the cold TDZ-violation throw is an exported call. */
 JS_EXTERN int JS_AOTThrowUninit(JSContext *ctx, JSFunctionBytecode *b, int idx,
                                 int is_ref);  /* always returns -1 */
+JS_EXTERN int JS_AOTThrowNonCtor(JSContext *ctx); /* OP_check_ctor; returns -1 */
 static inline int JS_AOTOpGetLocCheck(JSContext *ctx, JSValue **psp, JSFunctionBytecode *b,
                                       JSValue *var_buf, int idx) {
     if (JS_VALUE_GET_TAG(var_buf[idx]) == JS_TAG_UNINITIALIZED)
