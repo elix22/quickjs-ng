@@ -209,6 +209,12 @@ JS_EXTERN void JS_AOTExceptionBacktrace(JSContext *ctx, JSAOTFrame *frame);
 enum {
     JS_AOT_MF_SQRT, JS_AOT_MF_ABS, JS_AOT_MF_FLOOR, JS_AOT_MF_CEIL,
     JS_AOT_MF_MIN, JS_AOT_MF_MAX,
+    /* trig (cos/sin/tan) stays OUT — measured, not conservative (§17): they
+       ARE bit-exact-inlinable (pure `return cos(d)` wrappers, no JS special
+       case like pow), but inlining earns ~0% because they are libm-CALL-bound
+       (~50-100 cyc each) — the dispatch overhead inlining removes is noise next
+       to the computation. Contrast sqrt (1 hw instr, dispatch dominates → the
+       v3.5d 2.2×). Intrinsic inlining only pays for CHEAP ops. */
 };
 
 /* per-site inline caches (v2): opaque here; the generated file (compiled in-TU)
