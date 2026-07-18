@@ -251,7 +251,8 @@ _Static_assert(sizeof(JSStackFrame) <= JS_AOT_FRAME_SIZE,
 
 JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
                             JSFunctionBytecode *b, JSValueConst func_obj,
-                            JSValueConst this_obj, int argc, JSValueConst *argv,
+                            JSValueConst this_obj, JSValueConst new_target,
+                            int argc, JSValueConst *argv,
                             JSValue *locals, JSVarRef **frame_var_refs,
                             JSValue **parg_buf)
 {
@@ -259,6 +260,13 @@ JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
     JSStackFrame *sf = (JSStackFrame *)frame;
     int i, n;
     (void)this_obj;
+    /* upstream a3f1b38 added sf->is_constructor (CallSite.prototype
+       .isConstructor). The interpreter sets it from JS_CALL_FLAG_CONSTRUCTOR
+       AFTER the twin-dispatch branch returns, so twins must set it here: a
+       non-undefined new_target IS the constructor signal (derived-class ctors
+       carry super opcodes the translator rejects, so twins only ever see the
+       plain-ctor case). */
+    sf->is_constructor = !JS_IsUndefined(new_target);
     /* twin locals live on ITS C stack; mirror the interpreter's alloca guard with
        the same size accounting so recursion limits behave identically */
     size_t alloca_size = sizeof(JSValue) * ((size_t)b->arg_count + b->var_count +
@@ -980,7 +988,10 @@ static inline int tnr_aot_ic_get_hit(JSContext *ctx, JSAOTIC *ic, JSObject *p,
         JSObject *h = ic->holder ? ic->holder : p;
         JSShape *hsh = h->shape;
         if (ic->hshape == NULL || hsh == ic->hshape) {
-            JSShapeProperty *prs = &hsh->prop[ic->idx];
+            /* upstream moved shape prop descriptors behind get_shape_prop()
+               (they now live after the shape's flexible hash_table[]); the
+               object's own prop VALUES (h->prop[]) are unchanged. */
+            JSShapeProperty *prs = &get_shape_prop(hsh)[ic->idx];
             if (prs->atom == atom && !(prs->flags & JS_PROP_TMASK)) {
                 *pval = js_dup(h->prop[ic->idx].u.value);
                 return 1;
@@ -1104,7 +1115,7 @@ int JS_AOTOpPutFieldIC(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
         p = JS_VALUE_GET_OBJ(obj);
         /* IC hit: own, writable, plain value */
         if (p->shape == ic->rshape && ic->hshape == NULL) {
-            prs = &p->shape->prop[ic->idx];
+            prs = &get_shape_prop(p->shape)[ic->idx];
             if (prs->atom == atom &&
                 (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) ==
                     JS_PROP_WRITABLE) {

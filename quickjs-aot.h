@@ -70,7 +70,8 @@ typedef struct JSAOTFrame {
    var_ref_count slots (pass NULL when var_ref_count is 0). */
 JS_EXTERN JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
                                       JSFunctionBytecode *b, JSValueConst func_obj,
-                                      JSValueConst this_obj, int argc,
+                                      JSValueConst this_obj, JSValueConst new_target,
+                                      int argc,
                                       JSValueConst *argv, JSValue *locals,
                                       JSVarRef **frame_var_refs,
                                       JSValue **parg_buf);
