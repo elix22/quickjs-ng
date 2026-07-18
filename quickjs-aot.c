@@ -1374,13 +1374,40 @@ static inline int js_aot_math_check(JSContext *ctx, JSAtom math_atom,
         return 0;
     p = JS_VALUE_GET_OBJ(ctx->global_obj);
     prs = find_own_property(&pr, p, math_atom);
-    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+    if (!prs)
+        return 0;
+    /* quickjs-ng builds Math (and friends) LAZILY: until first access the
+       global's prop is JS_PROP_AUTOINIT, which raw find_own_property does not
+       realize — so the guard would deopt every intrinsic site in a process
+       that hasn't touched Math through the normal property path yet (the v3.6
+       fuzzer caught this as a silent all-boxed run). Materialize exactly like
+       JS_GetPropertyInternal would, then re-read. */
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+        if (JS_AutoInitProperty(ctx, p, math_atom, pr, prs))
+            return 0;
+        prs = find_own_property(&pr, p, math_atom);
+        if (!prs)
+            return 0;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
         return 0;
     if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
         return 0;
     p = JS_VALUE_GET_OBJ(pr->u.value);
     prs = find_own_property(&pr, p, fn_atom);
-    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+    if (!prs)
+        return 0;
+    /* Math's METHODS are lazy too (JS_SetPropertyFunctionList registers
+       autoinit props whose cfunctions build on first access) — same
+       materialization as the global Math prop above. */
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+        if (JS_AutoInitProperty(ctx, p, fn_atom, pr, prs))
+            return 0;
+        prs = find_own_property(&pr, p, fn_atom);
+        if (!prs)
+            return 0;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
         return 0;
     if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
         return 0;

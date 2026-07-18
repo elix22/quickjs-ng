@@ -47,6 +47,14 @@
 #include "quickjs-c-atomics.h"
 #include "quickjs-libc.h"
 
+/* TNR fork (run-test262-aot.c): JS_Eval, or the AOT qbc round-trip + twin
+   install under TNR_AOT_ROUNDTRIP=1 — the v3.6 test262 sweep. Twin inline
+   caches hold per-runtime references; each test's runtime must reset them
+   before JS_FreeRuntime (quickjs-aot.h contract). */
+JSValue tnr_262_eval(JSContext *ctx, const char *buf, size_t buf_len,
+                     const char *filename, int eval_flags);
+void tnr_262_reset_ics(JSContext *ctx);
+
 #define CMD_NAME "run-test262"
 
 // not quite correct because in theory someone could compile quickjs.c
@@ -1351,7 +1359,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
     tls->async_done = 0; /* counter of "Test262:AsyncTestComplete" messages */
 
     start = get_clock_ms();
-    res_val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
+    res_val = tnr_262_eval(ctx, buf, buf_len, filename, eval_flags); /* TNR fork */
 
     if ((is_async || ret_promise) && !JS_IsException(res_val)) {
         JSValue promise = JS_UNDEFINED;
@@ -1793,6 +1801,7 @@ int run_test_buf(ThreadLocalStorage *tls, const char *filename, char *harness,
         update_stats(rt, filename);
     }
     js_agent_free(ctx);
+    tnr_262_reset_ics(ctx); /* TNR fork: release IC refs into this runtime */
     JS_FreeContext(ctx);
     js_std_free_handlers(rt);
     JS_FreeRuntime(rt);
