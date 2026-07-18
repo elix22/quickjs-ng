@@ -57,6 +57,13 @@ static void tnr_262_report(void) {
     fprintf(stderr, "[tnr-262] twins installed across suite: %ld\n", n);
     tnr_262_write_count(n);
 }
+static void tnr_262_account(int installed) {
+    if (installed <= 0)
+        return;
+    long prev = atomic_fetch_add(&tnr_262_installed, installed);
+    if (prev / 512 != (prev + installed) / 512) /* periodic durable checkpoint */
+        tnr_262_write_count(prev + installed);
+}
 
 /* The IC lifecycle contract (quickjs-aot.h): cached shapes/holders hold REAL
    references into their runtime, and the static IC table outlives it — the
@@ -88,56 +95,49 @@ JSValue tnr_262_eval(JSContext *ctx, const char *buf, size_t buf_len,
     if (!atomic_exchange(&report_registered, 1))
         atexit(tnr_262_report);
 
-    /* Modules compile in a THROWAWAY context (qjsc's model: compile context
-       != run context). A COMPILE_ONLY module registers itself in that
-       context's loaded_modules; if it registered in the RUN context, the
-       JS_ReadObject copy would be a SECOND module under the same name and
-       resolution returns the FIRST — self-imports would bind to the stale,
-       never-evaluated compile artifact (test262 module-code/dynamic-import
-       instantiation tests catch exactly this; loaded_modules owns its
-       entries, so no GC trick can unlink the stale one). */
+    /* Twins depend on the .qbc serialization round-trip's ATOM REMAP (the twin
+       hash is over atom PAYLOADS, so it survives; the install must run against
+       remapped indices). SCRIPTS get the full round-trip — that is exactly
+       what product bundles are (esbuild emits one script), so scripts are the
+       representative and load-bearing case. MODULES do NOT round-trip:
+       JS_ReadObject of a module with imports resolves them EAGERLY through the
+       host loader, which re-reads and re-resolves — cyclic imports
+       (verify-dfs <-> its FIXTUREs) then re-enter without hitting the module
+       cache and run away (upstream read-path 1-byte overread + glibc heap
+       abort; ASan). That is upstream's module deserializer, not our twins.
+       So modules compile in-place, install twins on the SAME tree (identical
+       bytecode -> identical hash -> same twins engage), and run normally —
+       full twin coverage, none of the read-path fragility, and no second
+       module copy (which is what caused the earlier self-import
+       double-registration bug too). */
     int is_module = (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE;
-    JSContext *cctx = ctx;
+
     if (is_module) {
-        cctx = JS_NewContext(JS_GetRuntime(ctx));
-        if (!cctx)
-            return JS_ThrowOutOfMemory(ctx);
-    }
-    JSValue obj = JS_Eval(cctx, buf, buf_len, filename,
-                          eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (JS_IsException(obj)) {
-        if (cctx != ctx) { /* re-throw in the run context (values are
-                              runtime-level; tests compare error NAMES) */
-            JSValue e = JS_GetException(cctx);
-            JS_FreeContext(cctx);
-            return JS_Throw(ctx, e);
+        JSValue obj = JS_Eval(ctx, buf, buf_len, filename,
+                              eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(obj))
+            return obj;
+        tnr_262_account(JS_AOTInstallTable(ctx, obj, tnr_aot_table, tnr_aot_count));
+        if (JS_ResolveModule(ctx, obj) < 0) {
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
         }
-        return obj;
+        return JS_EvalFunction(ctx, obj); /* consumes obj */
     }
 
+    JSValue obj = JS_Eval(ctx, buf, buf_len, filename,
+                          eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(obj))
+        return obj;
     size_t bc_len = 0;
-    uint8_t *bc = JS_WriteObject(cctx, &bc_len, obj, JS_WRITE_OBJ_BYTECODE);
-    JS_FreeValue(cctx, obj);
-    if (cctx != ctx)
-        JS_FreeContext(cctx); /* takes the compile-only module with it */
-    if (!bc) /* cctx (and its pending exception) may be gone — throw fresh */
-        return JS_ThrowInternalError(ctx, "tnr-262: JS_WriteObject failed");
+    uint8_t *bc = JS_WriteObject(ctx, &bc_len, obj, JS_WRITE_OBJ_BYTECODE);
+    JS_FreeValue(ctx, obj);
+    if (!bc)
+        return JS_EXCEPTION;
     obj = JS_ReadObject(ctx, bc, bc_len, JS_READ_OBJ_BYTECODE);
     js_free(ctx, bc);
     if (JS_IsException(obj))
         return obj;
-
-    int installed = JS_AOTInstallTable(ctx, obj, tnr_aot_table, tnr_aot_count);
-    if (installed > 0) {
-        long prev = atomic_fetch_add(&tnr_262_installed, installed);
-        if (prev / 512 != (prev + installed) / 512)
-            tnr_262_write_count(prev + installed);
-    }
-
-    if ((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE &&
-        JS_ResolveModule(ctx, obj) < 0) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
+    tnr_262_account(JS_AOTInstallTable(ctx, obj, tnr_aot_table, tnr_aot_count));
     return JS_EvalFunction(ctx, obj); /* consumes obj */
 }
