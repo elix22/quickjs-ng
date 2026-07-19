@@ -29349,6 +29349,16 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
     JSAtom label_name;
     int tok;
 
+    /* TNR DEBUGGER (fork patch) A13: statement-start source position.
+       Upstream emits OP_source_loc only inside selected expressions (calls,
+       assignments, throw, expression statements) — `return x;` and let/const
+       declarations get NO marker, so breakpoints on those lines can't bind.
+       One marker per statement start gives the debugger statement-granular
+       positions; A12 folds them into pc2line. Debug builds only. */
+#ifdef TNR_QJS_DEBUGGER
+    emit_source_loc(s);
+#endif
+
     /* specific label handling */
     /* XXX: support multiple labels on loop statements */
     label_name = JS_ATOM_NULL;
@@ -35708,6 +35718,14 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
+        /* TNR DEBUGGER (fork patch) A12: statement-accurate pc2line. Upstream
+           records positions only at selected emission sites (calls, consts),
+           so plain statements (`return a;`, get/put_loc) get NO entry and
+           line breakpoints on them cannot bind. Record at every op once the
+           tracked position changed (deduped; slots grow on demand). */
+#ifdef TNR_QJS_DEBUGGER
+        js_debugger_pc2line_every_op(s, bc_out.size, line_num, col_num);
+#endif
         switch(op) {
         case OP_source_loc:
             /* line number info (for debug). We put it in a separate

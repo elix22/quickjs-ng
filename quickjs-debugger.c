@@ -33,9 +33,11 @@
  *    it (lived only via the request's refcount); restructured to free at end.
  *  - Protocol read errors detach cleanly instead of assert()ing.
  *
- * Breakpoints: P12.1 ships storage + protocol only; js_debugger_check_breakpoint
- * always misses. The quickjs-ng pc2line walker (per-entry column sleb128 —
- * the encoding change that broke prior community ports) lands in P12.2.
+ * Breakpoints (P12.2): per-function byte maps rebuilt lazily via the global
+ * dirty counter; the map builder walks quickjs-ng's pc2line encoding (which,
+ * unlike Bellard's, appends a column sleb128 to every entry — the drift that
+ * broke prior community ports) and supports column-qualified (inline)
+ * breakpoints. See js_debugger_check_breakpoint below.
  */
 
 #ifdef TNR_QJS_DEBUGGER
@@ -487,8 +489,17 @@ static int js_process_debugger_messages(JSDebuggerInfo *info, const uint8_t *cur
         if (type) {
             if (strcmp("request", type) == 0)
                 js_process_request(info, &state, JS_GetPropertyStr(ctx, message, "request"));
-            else if (strcmp("continue", type) == 0)
+            else if (strcmp("continue", type) == 0) {
+                /* bare continue must arm the same escape as the request-form
+                   continue: the interpreter's stacked CASE labels (e.g.
+                   push_0..push_7 share one body) run one js_debugger_check
+                   per label at the SAME pc, and a resumed breakpoint would
+                   re-fire on each without the escape */
+                info->stepping = JS_DEBUGGER_STEP_CONTINUE;
+                info->step_over = js_debugger_current_location(ctx, state.cur_pc);
+                info->step_depth = js_debugger_stack_depth(ctx);
                 info->is_paused = 0;
+            }
             else if (strcmp("breakpoints", type) == 0)
                 js_process_breakpoints(info, JS_GetPropertyStr(ctx, message, "breakpoints"));
             else if (strcmp("stopOnException", type) == 0) {
@@ -588,19 +599,34 @@ void js_debugger_check(JSContext *ctx, const uint8_t *cur_pc) {
     uint32_t depth;
 
     /* Stepping location check runs before the breakpoint check: a step must
-       escape its own statement even when that statement carries a breakpoint. */
+       escape its own statement even when that statement carries a breakpoint.
+       STEP_CONTINUE (resume-from-breakpoint) escapes by LINE, not column:
+       a line often spans several pc2line segments with different columns,
+       and a resumed breakpoint must not re-fire on each of them. Real steps
+       keep the column compare — column-granular stepping is a feature. */
     if (info->stepping) {
         location = js_debugger_current_location(ctx, cur_pc);
         depth = js_debugger_stack_depth(ctx);
         if (info->step_depth == depth
             && location.filename == info->step_over.filename
             && location.line == info->step_over.line
-            && location.column == info->step_over.column)
+            && (info->stepping == JS_DEBUGGER_STEP_CONTINUE
+                || location.column == info->step_over.column))
             goto done;
     }
 
     int at_breakpoint = js_debugger_check_breakpoint(ctx, info->breakpoints_dirty_counter, cur_pc);
     if (at_breakpoint) {
+#ifdef TNR_QJS_DEBUGGER_TRACE
+        {
+            JSDebuggerLocation l = js_debugger_current_location(ctx, cur_pc);
+            JSObject *tf = JS_VALUE_GET_OBJ(ctx->rt->current_stack_frame->cur_func);
+            JSFunctionBytecode *tb = tf->u.func.function_bytecode;
+            fprintf(stderr, "TRACE bp-hit line=%d col=%d depth=%u stepping=%d pc_off=%ld op=%d\n",
+                    l.line, l.column, js_debugger_stack_depth(ctx), info->stepping,
+                    (long)(cur_pc - tb->byte_code_buf - 1), cur_pc[-1]);
+        }
+#endif
         /* reaching a breakpoint cancels any in-flight step */
         info->stepping = 0;
         info->is_paused = 1;
@@ -608,8 +634,12 @@ void js_debugger_check(JSContext *ctx, const uint8_t *cur_pc) {
     }
     else if (info->stepping) {
         if (info->stepping == JS_DEBUGGER_STEP_CONTINUE) {
-            /* the statement has been escaped (checked above); resume free-run */
-            info->stepping = 0;
+            /* the statement has been escaped (checked above); resume free-run.
+               Exception: a function-entry check (pc=NULL) has no location —
+               don't let it cancel the escape before a real position is seen. */
+            location = js_debugger_current_location(ctx, cur_pc);
+            if (location.filename != 0)
+                info->stepping = 0;
         }
         else if (info->stepping == JS_DEBUGGER_STEP_IN) {
             /* stop on any location change: same-depth move, deeper (into a
@@ -745,6 +775,36 @@ void js_debugger_cooperate(JSContext *ctx) {
     js_debugger_info(JS_GetRuntime(ctx))->should_peek = 1;
 }
 
+/* Anchor A12 support: like add_pc2line_info(), but called for EVERY emitted
+   opcode of the compiler's final pass, and with a growable slot array —
+   upstream sizes source_loc_slots to the surviving OP_source_loc marker
+   count, which per-op recording can exceed. Same dedup rules, so the table
+   only grows by one entry per actual position change. */
+void js_debugger_pc2line_every_op(struct JSFunctionDef *s, uint32_t pc, int line_num, int col_num) {
+    if (s->source_loc_slots == NULL)
+        return; /* stripped build: no debug info wanted */
+    if (pc < s->line_number_last_pc)
+        return;
+    if (line_num == s->line_number_last && col_num == s->col_number_last)
+        return;
+    if (s->source_loc_count >= s->source_loc_size) {
+        int new_size = s->source_loc_size * 2 + 8;
+        SourceLocSlot *slots = js_realloc(s->ctx, s->source_loc_slots,
+                                          sizeof(*slots) * new_size);
+        if (!slots)
+            return; /* degrade to upstream behavior on OOM */
+        s->source_loc_slots = slots;
+        s->source_loc_size = new_size;
+    }
+    s->source_loc_slots[s->source_loc_count].pc = pc;
+    s->source_loc_slots[s->source_loc_count].line_num = line_num;
+    s->source_loc_slots[s->source_loc_count].col_num = col_num;
+    s->source_loc_count++;
+    s->line_number_last_pc = pc;
+    s->line_number_last = line_num;
+    s->col_number_last = col_num;
+}
+
 /* ------------------------------------------------------------------------ */
 /* internals: everything below needs quickjs.c statics/types                */
 /* ------------------------------------------------------------------------ */
@@ -767,7 +827,9 @@ JSDebuggerLocation js_debugger_current_location(JSContext *ctx, const uint8_t *c
         return location;
 
     JSFunctionBytecode *b = p->u.func.function_bytecode;
-    if (!b->pc2line_buf || !b->filename)
+    /* pc2line_buf may be NULL (one-line function, zero entries) —
+       find_line_num falls back to the function's own line in that case */
+    if (!b->filename)
         return location;
 
     /* at function entry (anchor A9) cur_pc is NULL and sf->cur_pc may still
@@ -814,7 +876,7 @@ JSValue js_debugger_build_backtrace(JSContext *ctx, const uint8_t *cur_pc) {
         p = JS_VALUE_GET_OBJ(sf->cur_func);
         if (p && js_class_has_bytecode(p->class_id)) {
             JSFunctionBytecode *b = p->u.func.function_bytecode;
-            if (b->pc2line_buf && b->filename) {
+            if (b->filename) {
                 /* cur_pc overrides the top frame only; callers' sf->cur_pc
                    already point after their call instruction */
                 const uint8_t *pc = (sf != ctx->rt->current_stack_frame || !cur_pc) ? sf->cur_pc : cur_pc;
@@ -842,15 +904,219 @@ JSValue js_debugger_build_backtrace(JSContext *ctx, const uint8_t *cur_pc) {
     return ret;
 }
 
-/* P12.1: breakpoint maps are not built yet — the quickjs-ng pc2line walker
-   (per-entry column sleb128) lands in P12.2. Storage and the dirty-counter
-   protocol are live above; this always reporting "no breakpoint here" is the
-   only stub in the file. */
+/* Breakpoint check (P12.2). The hot path is one byte load: each function
+   caches a byte map parallel to its bytecode (b->debugger.breakpoints,
+   1 = a breakpoint covers this pc), rebuilt lazily when the global
+   breakpoints_dirty_counter has moved past the function's cached stamp.
+
+   The rebuild walks the function's pc2line table with quickjs-ng's encoding —
+   THE part that differs from every Bellard-era debugger port: ng appends a
+   column sleb128 to EVERY entry (both the short form and the op==0 long
+   form), exactly mirroring find_line_num() above. The walk yields segments
+   [seg_start, seg_end) each carrying a (line, column) source position; a
+   segment is marked when a breakpoint matches its line and, if the
+   breakpoint carries a column (> 0, 1-based), the segment's column is at or
+   past it — giving column-accurate (inline) breakpoints for free. */
+/* Mark one pc2line segment in the breakpoint map, instruction by
+   instruction, skipping declaration plumbing. Hoisted function/class
+   declarations execute at scope entry with the DECLARATION's source
+   position — the whole hoist block is typically one (line,col) segment of
+   check_define_var / push_const+fclosure / define_func opcodes. Marking
+   those would fire a `function foo() {...}`-line breakpoint spuriously
+   while the enclosing scope is merely creating foo. Users break on
+   statements; declarations run silently — Chrome behaves the same.
+   (Skipping push_const is safe for real statements: some other opcode of
+   the statement carries the mark.) */
+static void js_debugger_mark_segment(JSFunctionBytecode *b, int seg_start, int seg_end) {
+    int pos = seg_start;
+    if (seg_end > b->byte_code_len)
+        seg_end = b->byte_code_len;
+    while (pos < seg_end) {
+        unsigned int op = b->byte_code_buf[pos];
+        int len = short_opcode_info(op).size;
+        if (len <= 0 || pos + len > seg_end)
+            len = seg_end - pos; /* defensive: never walk past the segment */
+        switch (op) {
+        case OP_check_define_var:
+        case OP_define_var:
+        case OP_push_const:
+        case OP_push_const8:
+        case OP_fclosure:
+        case OP_fclosure8:
+        case OP_define_func:
+        case OP_define_class:
+        case OP_define_class_computed:
+            break;
+        default:
+            memset(b->debugger.breakpoints + pos, 1, len);
+        }
+        pos += len;
+    }
+}
+
 int js_debugger_check_breakpoint(JSContext *ctx, uint32_t current_dirty, const uint8_t *cur_pc) {
-    (void)ctx;
-    (void)current_dirty;
-    (void)cur_pc;
-    return 0;
+    if (!ctx->rt->current_stack_frame)
+        return 0;
+    JSObject *f = JS_VALUE_GET_OBJ(ctx->rt->current_stack_frame->cur_func);
+    if (!f || !js_class_has_bytecode(f->class_id))
+        return 0;
+    JSFunctionBytecode *b = f->u.func.function_bytecode;
+    /* NOTE: pc2line_buf may be NULL — quickjs-ng emits ZERO pc2line entries
+       for a function whose ops never change source position (a one-line
+       function like `function one() { return 1; }`). Its whole body is then
+       a single segment at (b->line_num, b->col_num); only a missing
+       filename (stripped build) disables breakpoints. */
+    if (!b->filename)
+        return 0;
+
+    if (b->debugger.dirty == current_dirty)
+        goto lookup;
+
+    {
+        uint32_t prev_dirty = b->debugger.dirty;
+        b->debugger.dirty = current_dirty;
+
+        const char *filename = JS_AtomToCString(ctx, b->filename);
+        JSValue path_data = filename ? js_debugger_file_breakpoints(ctx, filename) : JS_UNDEFINED;
+        JS_FreeCString(ctx, filename);
+        if (JS_IsUndefined(path_data))
+            goto lookup; /* no client breakpoints for this file, ever */
+
+        /* if this file's breakpoints haven't changed since our last rebuild,
+           the cached map is already correct */
+        uint32_t path_dirty = js_get_property_as_uint32(ctx, path_data, "dirty");
+        if (path_dirty == prev_dirty && b->debugger.breakpoints) {
+            JS_FreeValue(ctx, path_data);
+            goto lookup;
+        }
+
+        if (!b->debugger.breakpoints) {
+            b->debugger.breakpoints = js_malloc_rt(ctx->rt, b->byte_code_len);
+            if (!b->debugger.breakpoints) {
+                JS_FreeValue(ctx, path_data);
+                return 0;
+            }
+        }
+        memset(b->debugger.breakpoints, 0, b->byte_code_len);
+#ifdef TNR_QJS_DEBUGGER_TRACE
+        {
+            const char *fn = JS_AtomToCString(ctx, b->func_name);
+            fprintf(stderr, "TRACE rebuild func=%s line_num=%d col_num=%d bclen=%d pc2line=%p buf=%p ops=[",
+                    fn ? fn : "?", b->line_num, b->col_num, b->byte_code_len, (void *)b->pc2line_buf,
+                    (void *)b->byte_code_buf);
+            for (int ti = 0; ti < b->byte_code_len && ti < 12; ti++)
+                fprintf(stderr, "%d ", b->byte_code_buf[ti]);
+            fprintf(stderr, "] p2l=[");
+            for (int ti = 0; ti < b->pc2line_len && ti < 24; ti++)
+                fprintf(stderr, "%d ", b->pc2line_buf[ti]);
+            fprintf(stderr, "] p2llen=%d\n", b->pc2line_len);
+            JS_FreeCString(ctx, fn);
+        }
+#endif
+
+        /* pull the breakpoint list into plain arrays once (the segment walk
+           below scans it per segment; lists are a handful of entries) */
+        JSValue bp_array = JS_GetPropertyStr(ctx, path_data, "breakpoints");
+        JS_FreeValue(ctx, path_data);
+        uint32_t bp_count = 0;
+        int *bp_lines = NULL, *bp_cols = NULL;
+        if (!JS_IsUndefined(bp_array)) {
+            JSValue len_val = JS_GetPropertyStr(ctx, bp_array, "length");
+            JS_ToUint32(ctx, &bp_count, len_val);
+            JS_FreeValue(ctx, len_val);
+        }
+        if (bp_count > 0) {
+            bp_lines = js_malloc(ctx, sizeof(int) * bp_count * 2);
+            if (!bp_lines) {
+                JS_FreeValue(ctx, bp_array);
+                return 0;
+            }
+            bp_cols = bp_lines + bp_count;
+            for (uint32_t i = 0; i < bp_count; i++) {
+                JSValue bp = JS_GetPropertyUint32(ctx, bp_array, i);
+                bp_lines[i] = (int)js_get_property_as_uint32(ctx, bp, "line");
+                bp_cols[i] = (int)js_get_property_as_uint32(ctx, bp, "column");
+                JS_FreeValue(ctx, bp);
+            }
+        }
+        JS_FreeValue(ctx, bp_array);
+
+        if (bp_count > 0) {
+            /* segment walk — decode identical to find_line_num() */
+            const uint8_t *p = b->pc2line_buf;
+            const uint8_t *p_end = p + b->pc2line_len;
+            int pc = 0, line = b->line_num, col = b->col_num;
+            int new_line, v, ret;
+            unsigned int op;
+
+            while (p && p < p_end) {
+                int seg_start = pc;
+                op = *p++;
+                if (op == 0) {
+                    uint32_t val;
+                    ret = get_leb128(&val, p, p_end);
+                    if (ret < 0)
+                        break;
+                    pc += val;
+                    p += ret;
+                    ret = get_sleb128(&v, p, p_end);
+                    if (ret < 0)
+                        break;
+                    p += ret;
+                    new_line = line + v;
+                } else {
+                    op -= PC2LINE_OP_FIRST;
+                    pc += (op / PC2LINE_RANGE);
+                    new_line = line + (op % PC2LINE_RANGE) + PC2LINE_BASE;
+                }
+                /* ng always encodes a column delta, unlike Bellard quickjs */
+                ret = get_sleb128(&v, p, p_end);
+                if (ret < 0)
+                    break;
+                p += ret;
+
+#ifdef TNR_QJS_DEBUGGER_TRACE
+                fprintf(stderr, "TRACE seg [%d,%d) line=%d col=%d op=%d\n",
+                        seg_start, pc, line, col, b->byte_code_buf[seg_start]);
+#endif
+                /* segment [seg_start, pc) executes at (line, col) */
+                if (pc > seg_start && pc <= b->byte_code_len) {
+                    for (uint32_t i = 0; i < bp_count; i++) {
+                        if (bp_lines[i] == line && (bp_cols[i] <= 0 || col >= bp_cols[i])) {
+                            js_debugger_mark_segment(b, seg_start, pc);
+                            break;
+                        }
+                    }
+                }
+                line = new_line;
+                col = col + v;
+            }
+            /* tail segment: [pc, byte_code_len) at the final (line, col) */
+            if (pc < b->byte_code_len) {
+                for (uint32_t i = 0; i < bp_count; i++) {
+                    if (bp_lines[i] == line && (bp_cols[i] <= 0 || col >= bp_cols[i])) {
+                        js_debugger_mark_segment(b, pc, b->byte_code_len);
+                        break;
+                    }
+                }
+            }
+        }
+        if (bp_lines)
+            js_free(ctx, bp_lines);
+    }
+
+lookup:
+    if (!b->debugger.breakpoints)
+        return 0;
+    {
+        const uint8_t *pc_ptr = cur_pc ? cur_pc : ctx->rt->current_stack_frame->cur_pc;
+        if (!pc_ptr)
+            return 0;
+        int pc_off = (int)(pc_ptr - b->byte_code_buf) - 1;
+        if (pc_off < 0 || pc_off >= b->byte_code_len)
+            return 0;
+        return b->debugger.breakpoints[pc_off];
+    }
 }
 
 JSValue js_debugger_local_variables(JSContext *ctx, int stack_index) {

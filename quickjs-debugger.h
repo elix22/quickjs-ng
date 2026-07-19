@@ -9,7 +9,7 @@
  *
  * MERGE-SURFACE CONTRACT (enforced by the consuming repo's gate):
  *  - quickjs.h is NEVER modified by this feature.
- *  - quickjs.c carries exactly 11 anchors, each a few lines, each wrapped in
+ *  - quickjs.c carries exactly 13 anchors, each a few lines, each wrapped in
  *    #ifdef TNR_QJS_DEBUGGER and tagged "TNR DEBUGGER (fork patch)":
  *      A1  top-of-file #include of this header (types for struct fields)
  *      A2  JSRuntime gains `JSDebuggerInfo debugger_info;`
@@ -22,6 +22,11 @@
  *      A9  JS_CallInternal: per-call-frame check at the restart label
  *      A10 free_function_bytecode frees the per-function breakpoint map
  *      A11 tail #include of quickjs-debugger.c (textual, after quickjs-aot.c)
+ *      A12 compiler final pass: per-op pc2line recording (statement-accurate
+ *          breakpoint positions; debug builds only)
+ *      A13 parser: one OP_source_loc per statement start (upstream marks only
+ *          calls/assignments/throw/expr-statements — `return x;` and let/const
+ *          lines otherwise have no position at all; debug builds only)
  *  - Everything else lives in quickjs-debugger.c, which is NOT a standalone
  *    translation unit: it is textually #included at the very end of quickjs.c
  *    (same doctrine as quickjs-aot.c) so its helpers can use file-local
@@ -53,7 +58,6 @@ extern "C" {
 typedef struct JSDebuggerFunctionInfo {
     uint8_t *breakpoints;
     uint32_t dirty;
-    int last_line_num;
 } JSDebuggerFunctionInfo;
 
 /* A source position as the engine sees it. filename is a JSAtom compared by
@@ -141,16 +145,23 @@ void js_debugger_new_context(JSContext *ctx);   /* A5: ThreadEvent "new" */
 void js_debugger_free_context(JSContext *ctx);  /* A6: ThreadEvent "exited" */
 void js_debugger_check(JSContext *ctx, const uint8_t *pc); /* A8/A9: per-opcode + per-call */
 void js_debugger_exception(JSContext *ctx);     /* A7: stop-on-exception */
+/* A12: called per emitted op in the compiler's final pass so every statement
+   position lands in pc2line (upstream only records at selected sites, which
+   loses `return x;`-style lines entirely). Debug builds trade a slightly
+   larger pc2line table for bindable breakpoints; release keeps upstream's. */
+struct JSFunctionDef;
+void js_debugger_pc2line_every_op(struct JSFunctionDef *s, uint32_t pc, int line_num, int col_num);
 
 /* ---- internals implemented in quickjs-debugger.c (need quickjs.c statics) */
 
 uint32_t js_debugger_stack_depth(JSContext *ctx);
 JSValue js_debugger_build_backtrace(JSContext *ctx, const uint8_t *cur_pc);
 JSDebuggerLocation js_debugger_current_location(JSContext *ctx, const uint8_t *cur_pc);
-/* Breakpoint map lookup/rebuild for the function at the top of the stack.
-   P12.1: storage only, always misses; the quickjs-ng pc2line walker lands in
-   P12.2 (ng's encoding differs from Bellard's — extra column sleb128 per
-   entry — which is exactly what broke prior community ports). */
+/* Breakpoint map lookup (and lazy rebuild) for the function at the top of
+   the stack. Line breakpoints mark every pc segment of the line; a breakpoint
+   with column > 0 (1-based) marks only segments at/after that column —
+   column-accurate inline breakpoints, possible because quickjs-ng's pc2line
+   carries a column per entry. */
 int js_debugger_check_breakpoint(JSContext *ctx, uint32_t current_dirty, const uint8_t *cur_pc);
 JSValue js_debugger_file_breakpoints(JSContext *ctx, const char *path);
 JSValue js_debugger_local_variables(JSContext *ctx, int stack_index);
