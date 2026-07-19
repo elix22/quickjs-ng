@@ -1,0 +1,111 @@
+# Build prebuilt libqjs for the threejs-native-runtime SDK (phase12 P12.6).
+#
+# Builds the PINNED commit (scripts/prebuilt/PINNED_COMMIT) — the exact quickjs-ng
+# fork commit whose headers the runtime host compiles against, debugger patches
+# included. Three variants per artifact: release (-O2, interpreter), debug (-O0),
+# debug-dbg (-O0 + TNR_QJS_DEBUGGER = the DAP engine). No AOT twins are ever baked
+# in (they must compile inside quickjs.c's TU at the runtime's build time).
+#
+# Artifacts publish to a permanent GitHub RELEASE (tag prebuilt-<shortsha>); the
+# runtime pins each asset's sha256 in libs.lock.json and fetches it into libs/qjs/.
+name: Build QuickJS Libraries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tnr-prebuilt]
+    paths:
+      - 'scripts/prebuilt/**'
+      - '.github/workflows/build-quickjs.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos,   os: macos-latest,   script: build-macos.sh,   asset: qjs-macos-universal.tar.gz }
+          - { name: ios,     os: macos-latest,   script: build-ios.sh,     asset: qjs-ios-static.tar.gz }
+          - { name: android, os: ubuntu-latest,  script: build-android.sh, asset: qjs-android.tar.gz }
+          - { name: linux,   os: ubuntu-latest,  script: build-linux.sh,   asset: qjs-linux-x64.tar.gz }
+          - { name: windows, os: windows-latest, script: build-windows.sh, asset: qjs-windows-x64.tar.gz }
+    steps:
+      - name: Checkout scripts (this branch, sparse — source comes at the pin below)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/prebuilt
+          path: tools-main
+
+      - name: Read pinned QuickJS commit
+        id: pin
+        run: |
+          SHA=$(tr -d '[:space:]' < tools-main/scripts/prebuilt/PINNED_COMMIT)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:9}" >> "$GITHUB_OUTPUT"
+
+      # Debug-loop economy: a pushed script tweak must not rebuild an artifact that is
+      # already published and immutable — probe the release first and no-op the job.
+      - name: Skip if this artifact is already published (immutable)
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="prebuilt-${{ steps.pin.outputs.short }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "${{ matrix.asset }}"; then
+            echo "${{ matrix.asset }} already published for $TAG — skipping the build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout pinned QuickJS source
+        if: steps.published.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pin.outputs.sha }}
+          path: qjs-src
+
+      - name: Set up MSVC (windows only — cl/dumpbin on PATH for the build + checks)
+        if: steps.published.outputs.skip != 'true' && matrix.name == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build
+        if: steps.published.outputs.skip != 'true'
+        run: bash tools-main/scripts/prebuilt/${{ matrix.script }} "$PWD/qjs-src" "$PWD/out"
+
+      - name: Upload build artifact (90-day convenience copy)
+        if: steps.published.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          retention-days: 90
+
+      - name: Publish to release (permanent, immutable per asset)
+        if: steps.published.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="prebuilt-${{ steps.pin.outputs.short }}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "QuickJS prebuilt ($TAG)" \
+              --notes "Prebuilt libqjs (release / debug / debug-dbg variants) at pinned commit ${{ steps.pin.outputs.sha }}. For threejs-native-runtime phase12 P12.6. Produced by build-quickjs.yml."
+          # First publish wins: the runtime pins each asset's sha256, so a re-upload
+          # (new bytes) would break every clone that fetched the pin. Delete an asset
+          # by hand only to deliberately republish, then re-pin the lock.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx "${{ matrix.asset }}"; then
+            echo "${{ matrix.asset }} already published for $TAG — keeping the pinned bytes, skipping upload"
+          else
+            gh release upload "$TAG" "out/${{ matrix.asset }}" --repo "$GITHUB_REPOSITORY"
+          fi
