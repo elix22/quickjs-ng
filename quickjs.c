@@ -45,6 +45,11 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
+/* TNR DEBUGGER (fork patch) A1: types for the debugger struct fields below.
+   All debugger logic lives in quickjs-debugger.c, included at end of file. */
+#ifdef TNR_QJS_DEBUGGER
+#include "quickjs-debugger.h"
+#endif
 #include "libregexp.h"
 #include "dtoa.h"
 
@@ -412,6 +417,11 @@ struct JSRuntime {
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
+    /* TNR DEBUGGER (fork patch) A2: per-runtime debugger state; transport_close
+       non-NULL == attached (selects the instrumented dispatch table). */
+#ifdef TNR_QJS_DEBUGGER
+    JSDebuggerInfo debugger_info;
+#endif
 };
 
 struct JSClass {
@@ -871,6 +881,11 @@ typedef struct JSFunctionBytecode {
        paths (js_create_function, JS_ReadFunctionTag) js_mallocz the struct, so
        the default is guaranteed NULL. Installed by JS_AOTInstallTable. */
     JSAOTFunc aot_func;
+    /* TNR DEBUGGER (fork patch) A3: lazily built per-function breakpoint map;
+       js_mallocz'd struct => all-zero default (no map, dirty=0). */
+#ifdef TNR_QJS_DEBUGGER
+    JSDebuggerFunctionInfo debugger;
+#endif
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -2634,6 +2649,11 @@ void JS_FreeRuntime(JSRuntime *rt)
     bool leak = false;
     int i;
 
+    /* TNR DEBUGGER (fork patch) A4: detach + send terminated before teardown */
+#ifdef TNR_QJS_DEBUGGER
+    js_debugger_free(rt, &rt->debugger_info);
+#endif
+
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
 
@@ -2898,6 +2918,11 @@ JSContext *JS_NewContext(JSRuntime *rt)
         return NULL;
     }
 
+    /* TNR DEBUGGER (fork patch) A5: announce the context to an attached client */
+#ifdef TNR_QJS_DEBUGGER
+    js_debugger_new_context(ctx);
+#endif
+
     return ctx;
 }
 
@@ -3026,6 +3051,11 @@ void JS_FreeContext(JSContext *ctx)
     if (--JS_REF_COUNT(ctx) > 0)
         return;
     assert(JS_REF_COUNT(ctx) == 0);
+
+    /* TNR DEBUGGER (fork patch) A6: announce context exit to an attached client */
+#ifdef TNR_QJS_DEBUGGER
+    js_debugger_free_context(ctx);
+#endif
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS
     if (check_dump_flag(rt, JS_DUMP_ATOMS))
@@ -7971,6 +8001,10 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
     JSRuntime *rt = ctx->rt;
     JS_FreeValue(ctx, rt->current_exception);
     rt->current_exception = obj;
+    /* TNR DEBUGGER (fork patch) A7: stop-on-exception pause point */
+#ifdef TNR_QJS_DEBUGGER
+    js_debugger_exception(ctx);
+#endif
     return JS_EXCEPTION;
 }
 
@@ -18002,6 +18036,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define BREAK           SWITCH(pc)
 #endif
 
+    /* TNR DEBUGGER (fork patch) A8: parallel dispatch table whose every label
+       runs js_debugger_check() before falling through to the real opcode.
+       Selected per call frame only while a debugger transport is attached, so
+       a detached engine executes the pristine upstream table at zero cost.
+       (Switch-dispatch builds instead test the attach flag inline per case;
+       the trailing tnr_dbg_ label swallows the call site's ':'.) */
+#ifdef TNR_QJS_DEBUGGER
+#if !DIRECT_DISPATCH
+#undef CASE
+#define CASE(op)        case op: if (caller_ctx->rt->debugger_info.transport_close) js_debugger_check(ctx, pc); tnr_dbg_ ## op
+#else
+    __extension__ static const void * const debugger_dispatch_table[256] = {
+#define DEF(id, size, n_pop, n_push, f) && case_debugger_OP_ ## id,
+#define def(id, size, n_pop, n_push, f)
+#include "quickjs-opcode.h"
+        [ OP_COUNT ... 255 ] = &&case_default
+    };
+    const void * const * active_dispatch_table =
+        caller_ctx->rt->debugger_info.transport_close ? debugger_dispatch_table
+                                                      : dispatch_table;
+#undef SWITCH
+#undef CASE
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *active_dispatch_table[opcode = *pc++]; });
+#define CASE(op)        case_debugger_ ## op: js_debugger_check(ctx, pc); case_ ## op
+#endif
+#endif
+
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
@@ -18109,6 +18170,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
         print_func_name(b);
+#endif
+
+    /* TNR DEBUGGER (fork patch) A9: once-per-frame check; gives stepping a
+       depth observation at every call boundary (pc=NULL = function entry). */
+#ifdef TNR_QJS_DEBUGGER
+    if (unlikely(rt->debugger_info.transport_close != NULL))
+        js_debugger_check(ctx, NULL);
 #endif
 
  restart:
@@ -36970,6 +37038,11 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     JS_FreeAtomRT(rt, b->filename);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
+
+    /* TNR DEBUGGER (fork patch) A10: per-function breakpoint map */
+#ifdef TNR_QJS_DEBUGGER
+    js_free_rt(rt, b->debugger.breakpoints);
+#endif
 
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(b) != 0) {
@@ -64240,3 +64313,10 @@ uintptr_t js_std_cmd(int cmd, ...) {
    needs this file's statics and is therefore textually included. See its
    header comment for the merge-surface rationale. */
 #include "quickjs-aot.c"
+
+/* TNR DEBUGGER (fork patch) A11 — all debugger code lives in
+   quickjs-debugger.c, textually included for the same reason as quickjs-aot.c.
+   See quickjs-debugger.h for the anchor inventory and merge contract. */
+#ifdef TNR_QJS_DEBUGGER
+#include "quickjs-debugger.c"
+#endif
