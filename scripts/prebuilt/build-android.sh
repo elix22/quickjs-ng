@@ -19,10 +19,12 @@ OUT="${2:?usage: build-android.sh <qjs-src-dir> <out-dir>}"
 NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
 [ -n "$NDK" ] && [ -f "$NDK/build/cmake/android.toolchain.cmake" ] \
   || { echo "FAIL: no Android NDK (set ANDROID_NDK_LATEST_HOME or ANDROID_NDK_HOME)"; exit 1; }
-# ELF symbol checks need the NDK's llvm-nm — host nm on macOS reads only Mach-O.
+# ELF tooling from the NDK — host nm/strip on macOS only speak Mach-O. NM drives the
+# debugger-symbol assertion; STRIP removes DWARF from the release variant (variants.sh).
 NM="$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/llvm-nm 2>/dev/null | head -1)"
-[ -n "$NM" ] || { echo "FAIL: llvm-nm not found under $NDK"; exit 1; }
-export NM
+STRIP="$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/llvm-strip 2>/dev/null | head -1)"
+[ -n "$NM" ] && [ -n "$STRIP" ] || { echo "FAIL: llvm-nm/llvm-strip not found under $NDK"; exit 1; }
+export NM STRIP
 STAGE="$OUT/stage-android"
 rm -rf "$STAGE"
 

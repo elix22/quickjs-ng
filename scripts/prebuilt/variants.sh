@@ -87,8 +87,18 @@ build_one_variant() {
   # Preserve the platform's static-lib prefix/ext so the consuming CMake resolves
   # the file with CMAKE_STATIC_LIBRARY_PREFIX/SUFFIX: unix libqjs.a -> libqjs-<v>.a,
   # MSVC qjs.lib -> qjs-<v>.lib.
-  local base ext prefix
+  local base ext prefix out
   base=$(basename "$built"); ext="${base##*.}"; prefix="${base%.*}"; prefix="${prefix%qjs}"
-  cp "$built" "$libdir/${prefix}qjs-${variant}.${ext}"
-  echo "  [$variant] -> $libdir/${prefix}qjs-${variant}.${ext}"
+  out="$libdir/${prefix}qjs-${variant}.${ext}"
+  cp "$built" "$out"
+  # RELEASE ships no debug info. The Android NDK adds -g to EVERY config (it expects
+  # the final .so to be stripped by Gradle), so an un-stripped -O3 release archive
+  # carries huge optimized-code DWARF — bigger than the -O0 debug archive. Strip it
+  # so `release` is genuinely the lean variant. `--strip-debug` keeps .symtab (link
+  # symbols) and DWARF-only; hosts whose strip lacks the flag (macOS) have no DWARF
+  # in release anyway, so the no-op is correct.
+  if [ "$variant" = release ]; then
+    "${STRIP:-strip}" --strip-debug "$out" 2>/dev/null || true
+  fi
+  echo "  [$variant] -> $out ($(du -h "$out" | cut -f1))"
 }
