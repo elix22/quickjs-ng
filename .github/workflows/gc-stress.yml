@@ -12,11 +12,7 @@ on:
       - '.github/workflows/gc-stress.yml'
   push:
     branches:
-      # FORK CHANGE: `tnr` is this fork's single project branch — upstream ships `master`
-      # here, keep `tnr` through merge conflicts. This fork patches the engine heavily, and
-      # on 2026-07-27 an uninitialised JSStackFrame field reached the collector from a twin:
-      # exactly what these runs detect, and it took a crash report to find by hand instead.
-      - tnr
+      - master
     paths:
       - '**'
       - '!.gitignore'
