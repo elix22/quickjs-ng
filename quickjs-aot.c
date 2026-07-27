@@ -201,6 +201,11 @@ typedef struct TnrProfFn {
     JSFunctionBytecode *fb;      /* run-local identity (the hash table key) */
     uint64_t hash;               /* JS_AOTFunctionHash — the PROFILE key (§4.1) */
     uint64_t calls;
+    /* Split by ENTRY PATH. JS_AOTFrameEnter fires for twin frames, the quickjs.c hook
+       fires only for interpreter frames, so the pair says how much of a function's
+       execution never reached a twin — the thing a `sample` profile shows as time in
+       JS_CallInternal but cannot attribute to a JS function. */
+    uint64_t calls_twin, calls_interp;
     uint64_t guard_hit, guard_miss;
     TnrProfField fields[TNR_PROF_MAX_FIELDS];
     uint8_t  nfields, field_overflow;
@@ -292,11 +297,14 @@ static TnrProfFn *tnr_prof_cur(void)
     return tnr_prof_intern(p->u.func.function_bytecode);
 }
 
-static void tnr_prof_note_call(JSFunctionBytecode *b)
+static void tnr_prof_note_call_path(JSFunctionBytecode *b, int twin)
 {
     TnrProfFn *f = tnr_prof_intern(b);
-    if (f) f->calls++;
+    if (!f) return;
+    f->calls++;
+    if (twin) f->calls_twin++; else f->calls_interp++;
 }
+static void tnr_prof_note_call(JSFunctionBytecode *b) { tnr_prof_note_call_path(b, 0); }
 
 /* One field-guard observation, attributed to the function that ran the guard.
    `slot` is NULL when the guard REJECTED — that is the datum §3.2 cares about most,
@@ -448,11 +456,13 @@ static void tnr_prof_note_site(JSStackFrame *sf, const uint8_t *next_pc, JSValue
 }
 
 #define TNR_PROF_NOTE_CALL(b)               tnr_prof_note_call(b)
+#define TNR_PROF_NOTE_TWIN(b)               tnr_prof_note_call_path(b, 1)
 #define TNR_PROF_NOTE_FIELD(o, a, s)        tnr_prof_note_field(o, a, s)
 #define TNR_PROF_NOTE_SITE(sf, pc, fn)      tnr_prof_note_site(sf, pc, fn)
 
 #else /* !TNR_AOT_PROFILE_COLLECT — shipping build: nothing at all */
 #define TNR_PROF_NOTE_CALL(b)               ((void)0)
+#define TNR_PROF_NOTE_TWIN(b)               ((void)0)
 #define TNR_PROF_NOTE_FIELD(o, a, s)        ((void)0)
 #define TNR_PROF_NOTE_SITE(sf, pc, fn)      ((void)0)
 #endif /* TNR_AOT_PROFILE_COLLECT */
@@ -731,6 +741,8 @@ int JS_AOTProfileDump(JSContext *ctx, const char *path, const char *bundle)
         tnr_prof_json_str(fp, f->name);
         fprintf(fp, ", \"loc\": ");
         tnr_prof_json_str(fp, f->loc);
+        fprintf(fp, ", \"callsTwin\": %llu, \"callsInterp\": %llu",
+                (unsigned long long)f->calls_twin, (unsigned long long)f->calls_interp);
         fprintf(fp, ", \"calls\": %llu, \"guardHit\": %llu, \"guardMiss\": %llu",
                 (unsigned long long)f->calls, (unsigned long long)f->guard_hit,
                 (unsigned long long)f->guard_miss);
@@ -911,7 +923,7 @@ static inline JSContext *js_aot_frame_enter_k(
     JSRuntime *rt = caller_ctx->rt;
     JSStackFrame *sf = (JSStackFrame *)frame;
     int i, n;
-    TNR_PROF_NOTE_CALL(b);   /* v4.1: twin-frame call count (no-op unless collecting) */
+    TNR_PROF_NOTE_TWIN(b);   /* v4.1: twin-frame call count (no-op unless collecting) */
     sf->is_constructor = !JS_IsUndefined(new_target);
     /* constant-folds to a literal */
     if (js_check_stack_overflow(rt, sizeof(JSValue) * ((size_t)k_arg_count +
@@ -1009,6 +1021,27 @@ JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     return b->realm;
+}
+
+/* Shape-specialized frame exit — the other half of js_aot_frame_enter_k, and the same
+ * argument: var_ref_count and arg_count are compile-time constants for a given twin.
+ * With them folded, the `if (var_ref_count != 0)` guard and its close_var_refs call
+ * disappear outright for the majority of twins (most functions capture nothing), and
+ * the free-range base becomes a constant offset. Semantics are the interpreter's 'done:'
+ * order verbatim, unchanged — see JS_AOTFrameLeave below. */
+static inline void js_aot_frame_leave_k(JSContext *ctx, JSAOTFrame *frame,
+                                        JSValue *locals, JSValue *sp,
+                                        int k_arg_count, int k_var_ref_count)
+{
+    JSStackFrame *sf = (JSStackFrame *)frame;
+    JSRuntime *rt = ctx->rt;
+    JSValue *pval;
+    if (k_var_ref_count != 0)          /* folds away entirely when 0 */
+        close_var_refs(rt, sf);
+    pval = (sf->arg_buf == locals) ? locals : locals + k_arg_count;
+    for (; pval < sp; pval++)
+        JS_FreeValue(ctx, *pval);
+    rt->current_stack_frame = sf->prev_frame;
 }
 
 void JS_AOTFrameLeave(JSContext *ctx, JSAOTFrame *frame, JSFunctionBytecode *b,
