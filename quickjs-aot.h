@@ -68,6 +68,12 @@ typedef struct JSAOTFrame {
    frame pushed, realm selected. Returns the realm context to run under, or NULL
    with an exception pending on the caller context. `frame_var_refs` must hold
    var_ref_count slots (pass NULL when var_ref_count is 0). */
+/* Shape-specialized frame entry. Generated twins call THIS, passing their own
+   arg/var/stack/var_ref counts and strictness as literals, so the prologue's loops and
+   its stack-size arithmetic constant-fold instead of being re-derived from `b` on every
+   call. Same semantics as JS_AOTFrameEnter — see the comment on the definition. Only
+   available same-TU (twins are #included into quickjs.c); the extern below stays for
+   standalone-compiled generated files. */
 JS_EXTERN JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
                                       JSFunctionBytecode *b, JSValueConst func_obj,
                                       JSValueConst this_obj, JSValueConst new_target,

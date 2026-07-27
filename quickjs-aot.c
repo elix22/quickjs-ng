@@ -883,6 +883,72 @@ const char *JS_AOTGetFuncName(JSContext *ctx, const JSFunctionBytecode *b)
 _Static_assert(sizeof(JSStackFrame) <= JS_AOT_FRAME_SIZE,
                "bump JS_AOT_FRAME_SIZE in quickjs-aot.h");
 
+/* Shape-specialized frame entry (perf, 2026-07-27).
+ *
+ * The generic JS_AOTFrameEnter below re-derives the callee's SHAPE from `b` on every
+ * call — arg_count, var_count, stack_size, var_ref_count, is_strict_mode — and runs two
+ * loops whose trip counts come from those loads. But a twin is generated FOR ONE
+ * FUNCTION: tnr-aotc already knows every one of those numbers at emit time and even
+ * writes them into the same prologue as literals (`var_buf = locals + 1`). So the twin
+ * was paying, per call, for facts the compiler had.
+ *
+ * Passing the shape as constants lets LLVM fold the alloca_size arithmetic, drop both
+ * loops when the counts are zero (they usually are — a leaf like Vector3.dot has
+ * var_count == var_ref_count == 0), and turn the short-argc copy into a fixed-length
+ * one. Nothing about the SEMANTICS changes: this is the same code with the same loads
+ * hoisted to compile time, which is why the differential is the gate.
+ *
+ * Worth doing because the call boundary is where the remaining time is: v4 §13 measured
+ * 30.4M JS calls in the workload, 99.4% of them into 19 functions.
+ */
+static inline JSContext *js_aot_frame_enter_k(
+    JSContext *caller_ctx, JSAOTFrame *frame, JSFunctionBytecode *b,
+    JSValueConst func_obj, JSValueConst new_target, int argc, JSValueConst *argv,
+    JSValue *locals, JSVarRef **frame_var_refs, JSValue **parg_buf,
+    int k_arg_count, int k_var_count, int k_stack_size, int k_var_ref_count,
+    int k_is_strict)
+{
+    JSRuntime *rt = caller_ctx->rt;
+    JSStackFrame *sf = (JSStackFrame *)frame;
+    int i, n;
+    TNR_PROF_NOTE_CALL(b);   /* v4.1: twin-frame call count (no-op unless collecting) */
+    sf->is_constructor = !JS_IsUndefined(new_target);
+    /* constant-folds to a literal */
+    if (js_check_stack_overflow(rt, sizeof(JSValue) * ((size_t)k_arg_count +
+                                                       k_var_count + k_stack_size) +
+                                    sizeof(JSVarRef *) * (size_t)k_var_ref_count)) {
+        JS_ThrowStackOverflow(caller_ctx);
+        return NULL;
+    }
+    sf->is_strict_mode = k_is_strict;
+    sf->cur_func = unsafe_unconst(func_obj);
+    if (argc >= k_arg_count) {
+        sf->arg_buf = (JSValue *)argv;
+        sf->arg_count = argc;
+    } else {
+        n = min_int(argc, k_arg_count);
+        for (i = 0; i < n; i++)
+            locals[i] = js_dup(argv[i]);
+        for (; i < k_arg_count; i++)
+            locals[i] = JS_UNDEFINED;
+        sf->arg_count = k_arg_count;
+        sf->arg_buf = locals;
+    }
+    *parg_buf = sf->arg_buf;
+    sf->var_buf = locals + k_arg_count;
+    for (i = 0; i < k_var_count; i++)          /* vanishes when k_var_count == 0 */
+        sf->var_buf[i] = JS_UNDEFINED;
+    sf->var_refs = frame_var_refs;
+    sf->var_ref_count = k_var_ref_count;
+    for (i = 0; i < k_var_ref_count; i++)      /* vanishes when k_var_ref_count == 0 */
+        frame_var_refs[i] = NULL;
+    sf->cur_pc = NULL;
+    sf->cur_sp = NULL;
+    sf->prev_frame = rt->current_stack_frame;
+    rt->current_stack_frame = sf;
+    return b->realm;
+}
+
 JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
                             JSFunctionBytecode *b, JSValueConst func_obj,
                             JSValueConst this_obj, JSValueConst new_target,
