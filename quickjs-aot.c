@@ -808,6 +808,16 @@ int JS_AOTProfileDump(JSContext *ctx, const char *path, const char *bundle)
                 cf = tnr_prof_find(s->caller);
                 fprintf(fp, "      { \"caller\": ");
                 tnr_prof_json_str(fp, cf ? cf->loc : "?");
+                /* v5.0: the HASH, not just the loc. A source location cannot be
+                   consumed by emission — tnr-aotc keys twins by JS_AOTFunctionHash,
+                   and a loc is neither unique (two functions can start on one line)
+                   nor stable across a re-bundle. Speculative inlining needs to join
+                   "this site calls that twin", so both ends carry the compiler's own
+                   key. Both hashes are already computed by tnr_prof_intern; this is
+                   only a wider dump, and no emission site changes (doctrine: v4's
+                   gate is that regenerated twins stay byte-identical). */
+                fprintf(fp, ", \"callerHash\": \"0x%016llx\"",
+                        (unsigned long long)(cf ? cf->hash : 0));
                 fprintf(fp, ", \"pc\": %u, \"calls\": %llu, \"native\": %llu,"
                             " \"nCallees\": %d, \"overflow\": %d, \"callees\": [",
                         s->pc, (unsigned long long)s->calls,
@@ -815,10 +825,19 @@ int JS_AOTProfileDump(JSContext *ctx, const char *path, const char *bundle)
                 for (i = 0; i < s->ncallees; i++) {
                     TnrProfFn *ce = tnr_prof_find(s->callee[i]);
                     if (i) fputc(',', fp);
-                    fprintf(fp, " { \"loc\": ");
+                    fprintf(fp, " { \"hash\": \"0x%016llx\", \"loc\": ",
+                            (unsigned long long)(ce ? ce->hash : 0));
                     tnr_prof_json_str(fp, ce ? ce->loc : "?");
                     fprintf(fp, ", \"name\": ");
                     tnr_prof_json_str(fp, ce ? ce->name : "");
+                    /* Whether the callee HAS a twin at all — the first filter every
+                       inline decision applies, and not otherwise recoverable from
+                       this file: a callee that is called but never entered as a twin
+                       frame is absent from "fns" entirely (that record is skipped
+                       when calls == 0 && nfields == 0), which reads identically to
+                       "cold". BufferAttribute.getX is the worked example. */
+                    fprintf(fp, ", \"twin\": %s",
+                            s->callee[i]->aot_func ? "true" : "false");
                     fprintf(fp, ", \"calls\": %llu }", (unsigned long long)s->ccount[i]);
                 }
                 fprintf(fp, " ] }");
