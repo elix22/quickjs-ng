@@ -2217,6 +2217,34 @@ reject:
     return NULL;
 }
 
+/* Entry guard for an OBJECT-valued field base (v5.1). Same shape as js_aot_fld_slot, but
+   the region wants the VALUE (to hang further field slots off) rather than the slot, and
+   the value must itself be a plain object: `this.normal.x` needs `normal` proven to be a
+   guardable object before `x` can resolve against it.
+
+   Returns the object value BORROWED — the owning property keeps the reference, and the
+   region never writes that property (tnr-aotc ends the region at any put_field naming a
+   registered object base), so it cannot be freed underneath us. Same lifetime argument as
+   the array/`this` borrows in §14.1c. JS_UNDEFINED means deopt; a field legitimately
+   holding undefined is not an object base either, so the sentinel is unambiguous. */
+static inline JSValue js_aot_fld_obj(JSValueConst v, JSAtom atom)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return JS_UNDEFINED;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id != JS_CLASS_OBJECT)
+        return JS_UNDEFINED;
+    prs = find_own_property(&pr, p, atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+        return JS_UNDEFINED;
+    return pr->u.value;
+}
+
 /* ---- v3.5d Math intrinsics (phase3 §14.4) ------------------------------------------
    Entry guard: the global `Math` binding is pristine (not shadowed by a
    let/const global, a plain own data prop of the global object) and the method
