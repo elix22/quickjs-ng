@@ -366,12 +366,95 @@ static void tnr_prof_release(JSRuntime *rt)
             }
 }
 
+/* ---- v4.4 measurement half: per-CALLSITE callee identity (v4 §13) -------------------
+   §18.4 names callee resolution as the hard sub-problem blocking speculative inlining:
+   three.js dispatch is polymorphic by NAME (`dot` is on V2/V3/V4/Quaternion), so the
+   compiler cannot resolve it statically. Whether the actual SITES are monomorphic at
+   run time is a different question, and an empirical one — this answers it before any
+   inlining machinery is designed against an assumption.
+
+   Callsite identity comes free: JS_AOTOpCall already receives `next_pc` (the emitter
+   passes `bc + <pos>`), so a site is (caller bytecode, byte offset) with NO emission
+   change — the same constraint v4.1 held to. The callee is the function object already
+   sitting at call_argv[-1] just before dispatch.
+
+   Callees are keyed by their JSFunctionBytecode, not by the closure object: two
+   closures over the same body are one inlining target. */
+#define TNR_PROF_MAX_CALLEES 4
+
+typedef struct TnrProfSite {
+    struct TnrProfSite *next;
+    JSFunctionBytecode *caller;
+    uint32_t pc;                                  /* byte offset of the call op */
+    uint64_t calls, native_calls;                 /* native = not a bytecode function */
+    JSFunctionBytecode *callee[TNR_PROF_MAX_CALLEES];
+    uint64_t ccount[TNR_PROF_MAX_CALLEES];
+    uint8_t  ncallees, overflow;
+} TnrProfSite;
+
+static TnrProfSite *g_prof_sites[TNR_PROF_BUCKETS];
+static uint64_t g_prof_nsites, g_prof_site_oom;
+
+static void tnr_prof_note_site(JSStackFrame *sf, const uint8_t *next_pc, JSValueConst fn)
+{
+    JSFunctionBytecode *caller, *callee = NULL;
+    JSObject *p;
+    TnrProfSite *s;
+    size_t h;
+    uint32_t pc;
+    int i;
+
+    if (!g_prof_on || !sf || !next_pc)
+        return;
+    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return;
+    caller = p->u.func.function_bytecode;
+    if (!caller || next_pc < caller->byte_code_buf ||
+        next_pc > caller->byte_code_buf + caller->byte_code_len)
+        return;
+    pc = (uint32_t)(next_pc - caller->byte_code_buf);
+
+    if (JS_VALUE_GET_TAG(fn) == JS_TAG_OBJECT) {
+        JSObject *fo = JS_VALUE_GET_OBJ(fn);
+        if (fo->class_id == JS_CLASS_BYTECODE_FUNCTION)
+            callee = fo->u.func.function_bytecode;
+    }
+
+    h = (((uintptr_t)caller >> 4) ^ (pc * 2654435761u)) & (TNR_PROF_BUCKETS - 1);
+    for (s = g_prof_sites[h]; s; s = s->next)
+        if (s->caller == caller && s->pc == pc)
+            break;
+    if (!s) {
+        s = calloc(1, sizeof *s);
+        if (!s) { g_prof_site_oom++; return; }
+        s->caller = caller; s->pc = pc;
+        s->next = g_prof_sites[h];
+        g_prof_sites[h] = s;
+        g_prof_nsites++;
+        tnr_prof_intern(caller);          /* so the dump can name the site */
+    }
+    s->calls++;
+    if (!callee) { s->native_calls++; return; }
+    tnr_prof_intern(callee);              /* caches the callee's hash + loc once */
+    for (i = 0; i < s->ncallees; i++)
+        if (s->callee[i] == callee) { s->ccount[i]++; return; }
+    if (s->ncallees >= TNR_PROF_MAX_CALLEES) { s->overflow = 1; return; }
+    s->callee[s->ncallees] = callee;
+    s->ccount[s->ncallees] = 1;
+    s->ncallees++;
+}
+
 #define TNR_PROF_NOTE_CALL(b)               tnr_prof_note_call(b)
 #define TNR_PROF_NOTE_FIELD(o, a, s)        tnr_prof_note_field(o, a, s)
+#define TNR_PROF_NOTE_SITE(sf, pc, fn)      tnr_prof_note_site(sf, pc, fn)
 
 #else /* !TNR_AOT_PROFILE_COLLECT — shipping build: nothing at all */
 #define TNR_PROF_NOTE_CALL(b)               ((void)0)
 #define TNR_PROF_NOTE_FIELD(o, a, s)        ((void)0)
+#define TNR_PROF_NOTE_SITE(sf, pc, fn)      ((void)0)
 #endif /* TNR_AOT_PROFILE_COLLECT */
 
 static int tnr_aot_walk(JSContext *ctx, JSFunctionBytecode *b,
@@ -539,6 +622,21 @@ static void tnr_prof_merge(TnrProfFn *dst, const TnrProfFn *src)
     }
 }
 
+/* Hottest first, then by CONTENT (caller hash, pc) — never by pointer, or the file
+   reorders under ASLR and doctrine #10's byte-equality gate fails. Same lesson as the
+   equal-hash records in §12.6. */
+static int tnr_prof_site_cmp(const void *a, const void *b)
+{
+    const TnrProfSite *x = *(TnrProfSite *const *)a, *y = *(TnrProfSite *const *)b;
+    const TnrProfFn *fx, *fy;
+    if (x->calls != y->calls) return x->calls > y->calls ? -1 : 1;
+    fx = tnr_prof_find(x->caller);
+    fy = tnr_prof_find(y->caller);
+    if (fx && fy && fx->hash != fy->hash) return fx->hash < fy->hash ? -1 : 1;
+    if (x->pc != y->pc) return x->pc < y->pc ? -1 : 1;
+    return 0;
+}
+
 static void tnr_prof_json_str(FILE *fp, const char *s)
 {
     fputc('"', fp);
@@ -654,8 +752,73 @@ int JS_AOTProfileDump(JSContext *ctx, const char *path, const char *bundle)
         fprintf(fp, "%s}", first ? "" : "\n    ");
         fprintf(fp, " }");
     }
-    fprintf(fp, "%s  }\n}\n", wrote_any ? "\n" : "");
+    fprintf(fp, "%s  },\n", wrote_any ? "\n" : "");
     }
+
+    /* ---- v4.4: callsites, hottest first ------------------------------------------
+       Only sites at or above TNR_PROF_SITE_MIN are written — inlining is a hot-path
+       question and the full set is tens of thousands of cold entries. The count that
+       is dropped is REPORTED, never silent: a truncated list that looks complete is
+       how a "we covered everything" conclusion gets made from partial data. */
+    #define TNR_PROF_SITE_MIN 1   /* all of them: the whole site table is ~100 entries,
+       and a per-run threshold would filter BEFORE the cross-scenario union, hiding
+       exactly the polymorphism that union exists to find (§3.3.2) */
+    {
+        TnrProfSite **sv, *s;
+        size_t nsites = 0, k, kept = 0, dropped = 0;
+        uint64_t mono_calls = 0, poly_calls = 0;
+        size_t b2;
+        sv = calloc(g_prof_nsites ? g_prof_nsites : 1, sizeof *sv);
+        if (sv) {
+            for (b2 = 0; b2 < TNR_PROF_BUCKETS; b2++)
+                for (s = g_prof_sites[b2]; s; s = s->next)
+                    if (nsites < g_prof_nsites) sv[nsites++] = s;
+            qsort(sv, nsites, sizeof *sv, tnr_prof_site_cmp);
+            for (k = 0; k < nsites; k++) {
+                int poly = sv[k]->overflow || sv[k]->ncallees > 1 ||
+                           (sv[k]->ncallees == 1 && sv[k]->native_calls);
+                if (poly) poly_calls += sv[k]->calls; else mono_calls += sv[k]->calls;
+            }
+            fprintf(fp, "  \"callsites\": {\n"
+                        "    \"total\": %zu, \"minCallsWritten\": %d,\n"
+                        "    \"callsThroughMonomorphicSites\": %llu,\n"
+                        "    \"callsThroughPolymorphicSites\": %llu,\n"
+                        "    \"sites\": [\n",
+                    nsites, TNR_PROF_SITE_MIN,
+                    (unsigned long long)mono_calls, (unsigned long long)poly_calls);
+            for (k = 0; k < nsites; k++) {
+                TnrProfFn *cf;
+                int i;
+                s = sv[k];
+                if (s->calls < TNR_PROF_SITE_MIN) { dropped++; continue; }
+                if (kept) fprintf(fp, ",\n");
+                kept++;
+                cf = tnr_prof_find(s->caller);
+                fprintf(fp, "      { \"caller\": ");
+                tnr_prof_json_str(fp, cf ? cf->loc : "?");
+                fprintf(fp, ", \"pc\": %u, \"calls\": %llu, \"native\": %llu,"
+                            " \"nCallees\": %d, \"overflow\": %d, \"callees\": [",
+                        s->pc, (unsigned long long)s->calls,
+                        (unsigned long long)s->native_calls, s->ncallees, s->overflow);
+                for (i = 0; i < s->ncallees; i++) {
+                    TnrProfFn *ce = tnr_prof_find(s->callee[i]);
+                    if (i) fputc(',', fp);
+                    fprintf(fp, " { \"loc\": ");
+                    tnr_prof_json_str(fp, ce ? ce->loc : "?");
+                    fprintf(fp, ", \"name\": ");
+                    tnr_prof_json_str(fp, ce ? ce->name : "");
+                    fprintf(fp, ", \"calls\": %llu }", (unsigned long long)s->ccount[i]);
+                }
+                fprintf(fp, " ] }");
+            }
+            fprintf(fp, "%s    ],\n    \"sitesOmittedBelowMin\": %zu\n  }\n",
+                    kept ? "\n" : "", dropped);
+            free(sv);
+        } else {
+            fprintf(fp, "  \"callsites\": { \"total\": 0, \"allocFailed\": true }\n");
+        }
+    }
+    fprintf(fp, "}\n");
     fclose(fp);
 
     fprintf(stderr,
@@ -1266,6 +1429,7 @@ int JS_AOTOpCall(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
     JSValue ret_val;
     int i;
     TNR_SF->cur_pc = (uint8_t *)next_pc;
+    TNR_PROF_NOTE_SITE(TNR_SF, next_pc, call_argv[-1]);   /* v4.4 measurement */
     ret_val = tnr_aot_call_dispatch(ctx, call_argv[-1],
                                     method ? call_argv[-2] : JS_UNDEFINED,
                                     argc, vc(call_argv));
@@ -1286,6 +1450,7 @@ int JS_AOTOpTailCall(JSContext *ctx, JSAOTFrame *frame, JSValue **psp,
     JSValue *call_argv = sp - argc;
     JSValue ret_val;
     TNR_SF->cur_pc = (uint8_t *)next_pc;
+    TNR_PROF_NOTE_SITE(TNR_SF, next_pc, call_argv[-1]);   /* v4.4 measurement */
     ret_val = tnr_aot_call_dispatch(ctx, call_argv[-1],
                                     method ? call_argv[-2] : JS_UNDEFINED,
                                     argc, vc(call_argv));
