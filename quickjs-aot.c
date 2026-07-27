@@ -1014,6 +1014,43 @@ _Static_assert(sizeof(JSStackFrame) <= JS_AOT_FRAME_SIZE,
  * Worth doing because the call boundary is where the remaining time is: v4 §13 measured
  * 30.4M JS calls in the workload, 99.4% of them into 19 functions.
  */
+
+/* THE FRAME IS MIRRORED BY HAND, SO UPSTREAM CAN BREAK IT SILENTLY.
+ *
+ * Both frame-enter paths below fill JSStackFrame field by field, and JSAOTFrame lives on
+ * the C stack — deliberately: memset-ing ~80 bytes on a path taking 30.4M calls is not
+ * free, and the emitter knows every value already. The cost is that a field ADDED
+ * upstream is never assigned, holds stack garbage, and C warns about nothing.
+ *
+ * That has now happened three times. a3f1b38 added is_constructor. 7955cfd added
+ * cur_gc_obj and then read it in js_release_coro()/mark_func(), so the first var_ref a
+ * twin created handed the collector a garbage pointer and five engine tests died inside
+ * free_property with EXC_BAD_ACCESS — from a merge that had ZERO conflicts.
+ *
+ * The shadow struct is the tripwire: it lists exactly the fields this file knows how to
+ * initialize. Same compiler, same padding rules, so any field upstream adds, removes or
+ * resizes moves sizeof() on one side only and this becomes a BUILD error naming the fix,
+ * instead of memory corruption inside generated code. When it fires: add the field to
+ * BOTH frame-enter paths and to the list here.
+ */
+_Static_assert(sizeof(JSStackFrame) == sizeof(struct {
+        struct JSStackFrame *prev_frame;
+        JSValue cur_func;
+        JSValue *arg_buf;
+        JSValue *var_buf;
+        struct JSVarRef **var_refs;
+        uint8_t *cur_pc;
+        uint16_t var_ref_count;
+        uint16_t arg_count;
+        bool is_strict_mode;
+        bool is_constructor;
+        JSValue *cur_sp;
+        struct JSGCObjectHeader *cur_gc_obj;
+    }),
+    "JSStackFrame changed shape: js_aot_frame_enter_k / JS_AOTFrameEnter fill it field by "
+    "field, so a new field would be uninitialized stack garbage in every twin frame. "
+    "Mirror it in BOTH paths, then update this shadow struct.");
+
 static inline JSContext *js_aot_frame_enter_k(
     JSContext *caller_ctx, JSAOTFrame *frame, JSFunctionBytecode *b,
     JSValueConst func_obj, JSValueConst new_target, int argc, JSValueConst *argv,
