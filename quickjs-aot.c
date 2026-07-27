@@ -1057,6 +1057,14 @@ static inline JSContext *js_aot_frame_enter_k(
         frame_var_refs[i] = NULL;
     sf->cur_pc = NULL;
     sf->cur_sp = NULL;
+    /* upstream 7955cfd added sf->cur_gc_obj: the GC object owning a HEAP-allocated
+       coroutine frame, NULL for an ordinary C-stack frame. A twin frame is always the
+       latter — the translator skips generator/async entirely — but JSAOTFrame lives on
+       the C stack and is initialized field by field, so leaving this unset hands
+       js_release_coro()/mark_func() a garbage pointer the moment a twin creates a
+       var_ref. (Same class as the a3f1b38 is_constructor note below: every new
+       JSStackFrame field must be mirrored here.) */
+    sf->cur_gc_obj = NULL;
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     return b->realm;
@@ -1119,6 +1127,7 @@ JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
         frame_var_refs[i] = NULL;
     sf->cur_pc = NULL;
     sf->cur_sp = NULL;
+    sf->cur_gc_obj = NULL;      /* see js_aot_frame_enter_k — upstream 7955cfd */
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     return b->realm;
