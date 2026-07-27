@@ -18118,18 +18118,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        translator rejects, so they never have twins. Generators resume
        mid-frame and COPY_ARGV callers own const argv (twins ALIAS argv when
        argc >= arg_count) — both must always interpret. */
-#ifdef TNR_AOT_PROFILE_COLLECT
-    /* v4.1 training only, compiled out otherwise. Counts frames the TWIN path never
-       sees, so "never executed" in the profile means never executed — not merely
-       "has no twin". Deliberately placed at this existing anchor rather than adding
-       a fourth one (doctrine #5). */
-    tnr_prof_note_call(b);
-#endif
     if (unlikely(b->aot_func != NULL) &&
         !(flags & (JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_COPY_ARGV))) {
         return b->aot_func(caller_ctx, func_obj, this_obj, new_target, argc,
                            argv, b, p->u.func.var_refs);
     }
+#ifdef TNR_AOT_PROFILE_COLLECT
+    /* v4.1 training only, compiled out otherwise. Counts INTERPRETER frames only, so
+       "never executed" in the profile means never executed rather than "has no twin".
+       MUST stay BELOW the dispatch branch: JS_AOTFrameEnter already counts every twin
+       entry, and twins are reached two ways — through here, and directly twin-to-twin
+       via tnr_aot_call_dispatch, which bypasses this function entirely. Counting above
+       the branch therefore double-counted exactly the twins that came through the
+       interpreter and single-counted the rest. Caught by arithmetic, not by a gate:
+       Vector3.constructor reported 18228 calls against 9114 guard misses in a region
+       that deopts on its first guard, i.e. exactly 1 guard per real call.
+       Deliberately at this existing anchor rather than adding a fourth (doctrine #5). */
+    tnr_prof_note_call(b);
+#endif
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
