@@ -109,10 +109,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="prebuilt-${{ steps.pin.outputs.short }}"
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          # THE CREATE RACES FIVE WAYS, EVERY RUN. All five platform jobs finish within a
+          # second or two of each other, all miss the `view`, and all call `create`; one
+          # wins and the rest get HTTP 422. Losing that race is SUCCESS, not failure, so
+          # fall back to re-checking existence — and only fail if the release still is not
+          # there, which is a real error. (Latent before: under PINNED_COMMIT a new tag was
+          # minted only on a deliberate pin bump, so five jobs rarely raced to create one.
+          # The tag is now the pushed sha, so every push mints a new tag and always races.
+          # It bit on the very first run: linux 422'd 1.5s after macos won.)
+          #
+          # --target pins the tag to THE COMMIT THAT WAS BUILT. Without it GitHub creates
+          # the tag from the repository's DEFAULT BRANCH (master), so a tag named after a
+          # `tnr` commit would point at an unrelated one. Ignored if the tag already exists.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "${{ steps.pin.outputs.sha }}" \
               --title "QuickJS prebuilt ($TAG)" \
-              --notes "Prebuilt libqjs (release / debug / debug-dbg variants) built from \`tnr\` at ${{ steps.pin.outputs.sha }}. INTERPRETER-ONLY (no AOT twins - those compile into quickjs.c's TU at the runtime's build time). For threejs-native-runtime phase12 P12.6. Produced by build-quickjs.yml."
+              --notes "Prebuilt libqjs (release / debug / debug-dbg variants) built from \`tnr\` at ${{ steps.pin.outputs.sha }}. INTERPRETER-ONLY (no AOT twins - those compile into quickjs.c's TU at the runtime's build time). For threejs-native-runtime phase12 P12.6. Produced by build-quickjs.yml." \
+            || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          fi
           # First publish wins: the runtime pins each asset's sha256, so a re-upload
           # (new bytes) would break every clone that fetched the pin. Delete an asset
           # by hand only to deliberately republish, then re-pin the lock.
