@@ -449,6 +449,12 @@ typedef struct JSStackFrame {
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
+    /* only set for coroutine frames (async function / generator /
+       async generator): the GC object owning this heap-allocated frame,
+       NULL for ordinary C-stack frames. Lets a var_ref capturing one of
+       the coroutine's locals keep the (suspended) coroutine reachable by
+       the cycle collector. */
+    struct JSGCObjectHeader *cur_gc_obj;
 } JSStackFrame;
 
 typedef enum {
@@ -475,6 +481,20 @@ typedef struct JSVarRef {
     uint8_t is_detached;
     uint8_t is_lexical; /* only used with global variables */
     uint8_t is_const; /* only used with global variables */
+    /* Set at creation for an open var_ref that captures a local of a
+       coroutine (async function / generator / async generator): such a
+       var_ref holds a counted reference to that coroutine's GC object and
+       is itself a GC object, so the cycle collector can see the closure ->
+       var_ref -> coroutine edge and keep the suspended coroutine (hence the
+       captured variable it points into) alive. The coroutine is recovered
+       as stack_frame->cur_gc_obj (valid while open). This is a *snapshot* of
+       cur_gc_obj != NULL taken at creation, NOT rederived at read time:
+       cur_gc_obj transitions NULL -> owner (it is set only after a
+       generator's initial resume), so var_refs created during the prologue
+       (e.g. mapped `arguments`) must stay non-coro even though cur_gc_obj is
+       later set. Cleared when the var_ref is detached; the ref is released on
+       detach/free. */
+    uint8_t is_coro;
     JSValue *pvalue; /* pointer to the value, either on the stack or
                         to 'value' */
     union {
@@ -592,6 +612,7 @@ struct JSContext {
     double time_origin;
 
     uint64_t random_state;
+    uint32_t hash_seed;
 
     /* when the counter reaches zero, JSRutime.interrupt_handler is called */
     int interrupt_counter;
@@ -1033,6 +1054,11 @@ struct JSModuleDef {
     int import_entries_count;
     int import_entries_size;
 
+    /* import attributes the module was requested with, JS_UNDEFINED if
+       none; the same module name can be loaded with different attributes
+       (e.g. as both a JS module and a text module) */
+    JSValue attributes;
+
     JSValue module_ns;
     JSValue func_obj; /* only used for JS modules */
     JSModuleInitFunc *init_func; /* only used for C modules */
@@ -1384,6 +1410,7 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv, int magic);
 static JSValue js_object_defineProperty(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv, int magic);
+static uint64_t xorshift64star(uint64_t *pstate);
 
 typedef enum JSStrictEqModeEnum {
     JS_EQ_STRICT,
@@ -1460,12 +1487,16 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *input, size_t input_len,
                                const char *filename, int line, int flags, int scope_idx);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+static int js_module_attributes_equal(JSContext *ctx, JSValueConst attr1,
+                                      JSValueConst attr2);
 static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                JS_MarkFunc *mark_func);
 static JSValue js_import_meta(JSContext *ctx);
 static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
                                  JSValueConst options);
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
+static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s);
+static void js_release_coro(JSRuntime *rt, JSGCObjectHeader *coro);
 static JSValue js_new_promise_capability(JSContext *ctx,
                                          JSValue *resolving_funcs,
                                          JSValueConst ctor);
@@ -2887,6 +2918,12 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
+    // TODO(bnoordhuis) use getrandom() etc.
+    ctx->random_state = js__gettimeofday_us();
+    // the state must be non zero
+    if (ctx->random_state == 0)
+        ctx->random_state = 1;
+    ctx->hash_seed = xorshift64star(&ctx->random_state);
 
     if (JS_AddIntrinsicBasicObjects(ctx)) {
         JS_FreeContext(ctx);
@@ -3238,7 +3275,7 @@ static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
 
     for(i = 0; i < len; i++)
         h = h * 263 + str[i];
-    return h;
+    return h ^ hash32(len);
 }
 
 static inline uint32_t hash_string16(const uint16_t *str,
@@ -3248,7 +3285,7 @@ static inline uint32_t hash_string16(const uint16_t *str,
 
     for(i = 0; i < len; i++)
         h = h * 263 + str[i];
-    return h;
+    return h ^ hash32(len);
 }
 
 static uint32_t hash_string(JSString *str, uint32_t h)
@@ -6891,6 +6928,23 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr,
     return NULL;
 }
 
+/* Release a counted reference an open var_ref held on the coroutine
+   (async function / generator / async generator) owning the frame it
+   points into. */
+static void js_release_coro(JSRuntime *rt, JSGCObjectHeader *coro)
+{
+    switch (JS_GC_TYPE(coro)) {
+    case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
+        js_async_function_free(rt, (JSAsyncFunctionData *)coro);
+        break;
+    case JS_GC_OBJ_TYPE_JS_OBJECT: /* generator / async generator */
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, (JSObject *)coro));
+        break;
+    default:
+        abort();
+    }
+}
+
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
     if (var_ref) {
@@ -6903,6 +6957,12 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
                 JSStackFrame *sf = var_ref->stack_frame;
                 assert(sf->var_refs[var_ref->var_ref_idx] == var_ref);
                 sf->var_refs[var_ref->var_ref_idx] = NULL;
+                /* an open coroutine var_ref is itself a GC object and holds
+                   a counted ref to its coroutine (sf->cur_gc_obj) */
+                if (var_ref->is_coro) {
+                    js_release_coro(rt, sf->cur_gc_obj);
+                    remove_gc_object(&var_ref->header);
+                }
             }
             js_free_rt(rt, var_ref);
         }
@@ -7001,7 +7061,10 @@ static void js_bytecode_function_mark(JSRuntime *rt, JSValueConst val,
         if (var_refs) {
             for(i = 0; i < b->closure_var_count; i++) {
                 JSVarRef *var_ref = var_refs[i];
-                if (var_ref && var_ref->is_detached) {
+                /* Detached var_refs are GC objects; open var_refs are GC
+                   objects only when they capture a coroutine local (see
+                   get_var_ref). Only those may be marked. */
+                if (var_ref && (var_ref->is_detached || var_ref->is_coro)) {
                     mark_func(rt, &var_ref->header);
                 }
             }
@@ -7284,7 +7347,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                             if (pr->u.getset.setter)
                                 mark_func(rt, &pr->u.getset.setter->header);
                         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
-                            if (pr->u.var_ref->is_detached) {
+                            if (pr->u.var_ref->is_detached ||
+                                pr->u.var_ref->is_coro) {
                                 /* Note: the tag does not matter
                                    provided it is a GC object */
                                 mark_func(rt, &pr->u.var_ref->header);
@@ -7326,9 +7390,17 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     case JS_GC_OBJ_TYPE_VAR_REF:
         {
             JSVarRef *var_ref = (JSVarRef *)gp;
-            /* only detached variable referenced are taken into account */
-            assert(var_ref->is_detached);
-            JS_MarkValue(rt, *var_ref->pvalue, mark_func);
+            if (var_ref->is_detached) {
+                /* the var_ref owns its value */
+                JS_MarkValue(rt, *var_ref->pvalue, mark_func);
+            } else {
+                /* open var_ref: the value lives in the coroutine's frame
+                   and is marked by the coroutine itself; only keep that
+                   coroutine reachable. (Open var_refs are GC objects only
+                   when they capture a coroutine local.) */
+                assert(var_ref->is_coro);
+                mark_func(rt, var_ref->stack_frame->cur_gc_obj);
+            }
         }
         break;
     case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
@@ -10623,17 +10695,28 @@ retry:
                         if (ret < 0)
                             goto fail;
                     typed_array_oob:
-                        // per spec: evaluate value for side effects
-                        if (p1->class_id == JS_CLASS_BIG_INT64_ARRAY ||
-                            p1->class_id == JS_CLASS_BIG_UINT64_ARRAY) {
-                            int64_t v;
-                            if (JS_ToBigInt64Free(ctx, &v, val))
-                                return -1;
+                        /* [[Set]] (10.4.5.5): an out-of-bounds or non-canonical
+                           integer index only coerces the value (step i, via
+                           TypedArraySetElement) when the receiver is the typed
+                           array itself. With any other receiver the invalid
+                           index is dropped (step ii) without evaluating the
+                           value. p is the receiver object (NULL for a primitive
+                           receiver), p1 is the typed array. */
+                        if (p == p1) {
+                            // evaluate value for side effects
+                            if (p1->class_id == JS_CLASS_BIG_INT64_ARRAY ||
+                                p1->class_id == JS_CLASS_BIG_UINT64_ARRAY) {
+                                int64_t v;
+                                if (JS_ToBigInt64Free(ctx, &v, val))
+                                    return -1;
+                            } else {
+                                val = JS_ToNumberFree(ctx, val);
+                                JS_FreeValue(ctx, val);
+                                if (JS_IsException(val))
+                                    return -1;
+                            }
                         } else {
-                            val = JS_ToNumberFree(ctx, val);
                             JS_FreeValue(ctx, val);
-                            if (JS_IsException(val))
-                                return -1;
                         }
                         return true;
                     }
@@ -16675,8 +16758,12 @@ static void js_mapped_arguments_mark(JSRuntime *rt, JSValueConst val,
         int i;
         if (var_refs) {
             for(i = 0; i < p->u.array.count; i++) {
-                if (var_refs[i] && var_refs[i]->is_detached)
-                    mark_func(rt, &var_refs[i]->header);
+                /* mapped arguments hold a counted ref to each var_ref; the
+                   ones that are GC objects (detached, or open capturing a
+                   coroutine local) must be marked, like the other holders */
+                JSVarRef *vr = var_refs[i];
+                if (vr && (vr->is_detached || vr->is_coro))
+                    mark_func(rt, &vr->header);
             }
         }
     }
@@ -17474,6 +17561,7 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object)
         return NULL;
     JS_REF_COUNT(var_ref) = 1;
     var_ref->is_detached = true;
+    var_ref->is_coro = false;
     var_ref->value = JS_UNDEFINED;
     var_ref->pvalue = &var_ref->value;
     if (is_gc_object)
@@ -17524,6 +17612,19 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
         var_ref->stack_frame = sf;
         sf->var_refs[var_ref_idx] = var_ref;
         var_ref->pvalue = pvalue;
+        /* If this local belongs to a coroutine (async function, generator or
+           async generator), keep the coroutine reachable for as long as a
+           closure references the variable: make the open var_ref a GC object
+           holding a counted reference to the coroutine (sf->cur_gc_obj).
+           Otherwise (ordinary C-stack frame, cur_gc_obj == NULL) the running
+           function is a GC root and no extra bookkeeping is needed. Snapshot
+           the decision in is_coro now (cur_gc_obj may become non-NULL later);
+           the coroutine itself is recovered via stack_frame->cur_gc_obj. */
+        var_ref->is_coro = (sf->cur_gc_obj != NULL);
+        if (sf->cur_gc_obj) {
+            JS_REF_COUNT(sf->cur_gc_obj)++;
+            add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
+        }
         return var_ref;
     } else {
         /* Variable is not captured (e.g., from eval closures on uncaptured vars).
@@ -17533,6 +17634,7 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
             return NULL;
         JS_REF_COUNT(var_ref) = 1;
         var_ref->is_detached = true;
+        var_ref->is_coro = false;
         var_ref->value = js_dup(*pvalue);
         var_ref->pvalue = &var_ref->value;
         add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
@@ -17768,11 +17870,27 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
 
 static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
+    JSGCObjectHeader *coro;
+    /* Already closed. This can happen during reentrant coroutine teardown:
+       closing one var_ref can drop the coroutine's refcount to zero and
+       re-enter close_var_refs on the same frame. Once detached, the union
+       holds 'value' rather than stack_frame, so we must not touch it. */
+    if (var_ref->is_detached)
+        return;
+    /* Read the coroutine (if any) before js_dup() overwrites the union
+       member that aliases stack_frame with 'value'. */
+    coro = var_ref->is_coro ? var_ref->stack_frame->cur_gc_obj : NULL;
     var_ref->value = js_dup(*var_ref->pvalue);
     var_ref->pvalue = &var_ref->value;
     /* the reference is no longer to a local variable */
     var_ref->is_detached = true;
-    add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
+    var_ref->is_coro = false;
+    /* an open coroutine var_ref is already a GC object and holds a
+       reference to its coroutine; drop it now that it is detached. */
+    if (coro)
+        js_release_coro(rt, coro);
+    else
+        add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 }
 
 static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
@@ -18178,6 +18296,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
+    /* ordinary C-stack frame: not owned by a coroutine GC object */
+    sf->cur_gc_obj = NULL;
     sp = stack_buf;
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
@@ -21180,6 +21300,8 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     sf->arg_count = arg_buf_len;
     sf->var_buf = sf->arg_buf + arg_buf_len;
     sf->cur_sp = sf->var_buf + b->var_count;
+    /* set by the caller once the owning coroutine GC object exists */
+    sf->cur_gc_obj = NULL;
     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
@@ -21417,6 +21539,10 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
     if (JS_IsException(obj))
         goto fail;
     JS_SetOpaqueInternal(obj, s);
+    /* the body only starts running on the first next(); root captured
+       locals against the generator object from now on (the initial resume
+       above only reaches OP_initial_yield, before any user code) */
+    s->func_state.frame.cur_gc_obj = &JS_VALUE_GET_OBJ(obj)->header;
     return obj;
  fail:
     free_generator_stack_rt(ctx->rt, s);
@@ -21616,6 +21742,9 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
         return JS_EXCEPTION;
     }
     s->is_active = true;
+    /* the body runs immediately (up to the first await), so the frame must
+       already know its owning coroutine to root captured locals */
+    s->func_state.frame.cur_gc_obj = &s->header;
 
     if (!js_async_function_resume(ctx, s))
         goto fail;
@@ -22062,6 +22191,9 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
     if (JS_IsException(obj))
         goto fail;
     s->generator = JS_VALUE_GET_OBJ(obj);
+    /* root captured locals against the async generator object (the initial
+       resume above only reaches OP_initial_yield, before any user code) */
+    s->func_state.frame.cur_gc_obj = &s->generator->header;
     JS_SetOpaqueInternal(obj, s);
     return obj;
  fail:
@@ -27181,6 +27313,14 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
     case TOK_IDENT:
         {
             JSAtom name;
+            int identifier_line_num = s->token.line_num;
+            const uint8_t *identifier_line_start = s->token.ptr;
+            while (identifier_line_start > s->buf_start &&
+                   identifier_line_start[-1] != '\n' &&
+                   identifier_line_start[-1] != '\r')
+                identifier_line_start--;
+            int identifier_col_num =
+                (int)(s->token.ptr - identifier_line_start) + 1;
             if (s->token.u.ident.is_reserved) {
                 return js_parse_error_reserved_identifier(s);
             }
@@ -27218,6 +27358,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     return -1;
                 }
             do_get_var:
+                emit_source_loc_at(s, identifier_line_num, identifier_col_num);
                 emit_op(s, OP_scope_get_var);
                 emit_u32(s, name);
                 emit_u16(s, s->cur_func->scope_level);
@@ -30303,6 +30444,7 @@ static JSModuleDef *js_new_module_def(JSContext *ctx, JSAtom name)
     m->resolving_funcs[0] = JS_UNDEFINED;
     m->resolving_funcs[1] = JS_UNDEFINED;
     m->private_value = JS_UNDEFINED;
+    m->attributes = JS_UNDEFINED;
     list_add_tail(&m->link, &ctx->loaded_modules);
     return m;
 }
@@ -30333,6 +30475,7 @@ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
     JS_MarkValue(rt, m->resolving_funcs[0], mark_func);
     JS_MarkValue(rt, m->resolving_funcs[1], mark_func);
     JS_MarkValue(rt, m->private_value, mark_func);
+    JS_MarkValue(rt, m->attributes, mark_func);
 }
 
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
@@ -30374,6 +30517,7 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, m->resolving_funcs[0]);
     JS_FreeValue(ctx, m->resolving_funcs[1]);
     JS_FreeValue(ctx, m->private_value);
+    JS_FreeValue(ctx, m->attributes);
     list_del(&m->link);
     js_free(ctx, m);
 }
@@ -30381,16 +30525,22 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
 #ifndef QJS_DISABLE_PARSER
 
 static int add_req_module_entry(JSContext *ctx, JSModuleDef *m,
-                                JSAtom module_name)
+                                JSAtom module_name, JSValueConst attributes)
 {
     JSReqModuleEntry *rme;
-    int i;
+    int i, eq;
 
-    /* no need to add the module request if it is already present */
+    /* no need to add the module request if an equivalent one (same
+       specifier and same import attributes) is already present */
     for(i = 0; i < m->req_module_entries_count; i++) {
         rme = &m->req_module_entries[i];
-        if (rme->module_name == module_name)
-            return i;
+        if (rme->module_name == module_name) {
+            eq = js_module_attributes_equal(ctx, rme->attributes, attributes);
+            if (eq < 0)
+                return -1;
+            if (eq)
+                return i;
+        }
     }
 
     if (js_resize_array(ctx, (void **)&m->req_module_entries,
@@ -30401,7 +30551,7 @@ static int add_req_module_entry(JSContext *ctx, JSModuleDef *m,
     rme = &m->req_module_entries[m->req_module_entries_count++];
     rme->module_name = JS_DupAtom(ctx, module_name);
     rme->module = NULL;
-    rme->attributes = JS_UNDEFINED;
+    rme->attributes = js_dup(attributes);
     return i;
 }
 
@@ -30636,12 +30786,101 @@ static char *js_default_module_normalize_name(JSContext *ctx,
     return filename;
 }
 
-static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name)
+/* Two sets of import attributes are equal if they have the same
+   key/value pairs; absent attributes are equivalent to an empty set
+   (ModuleRequestsEqual). Returns 1, 0 or -1 in case of exception. */
+static int js_module_attributes_equal(JSContext *ctx, JSValueConst attr1,
+                                      JSValueConst attr2)
+{
+    JSPropertyEnum *tab = NULL;
+    uint32_t len = 0, len2 = 0, i;
+    JSValue v1, v2;
+    JSAtom a1, a2;
+    int res;
+
+    if (JS_IsObject(attr1)) {
+        if (JS_GetOwnPropertyNames(ctx, &tab, &len, attr1,
+                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
+            return -1;
+    }
+    if (JS_IsObject(attr2)) {
+        JSPropertyEnum *tab2 = NULL;
+        if (JS_GetOwnPropertyNames(ctx, &tab2, &len2, attr2,
+                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+            res = -1;
+            goto done;
+        }
+        js_free_prop_enum(ctx, tab2, len2);
+    }
+    res = 0;
+    if (len != len2)
+        goto done;
+    for (i = 0; i < len; i++) {
+        v1 = JS_GetProperty(ctx, attr1, tab[i].atom);
+        if (JS_IsException(v1)) {
+            res = -1;
+            goto done;
+        }
+        v2 = JS_GetProperty(ctx, attr2, tab[i].atom);
+        if (JS_IsException(v2)) {
+            JS_FreeValue(ctx, v1);
+            res = -1;
+            goto done;
+        }
+        if (JS_IsUndefined(v2)) {
+            /* attribute values are strings, undefined means the key is
+               not present */
+            JS_FreeValue(ctx, v1);
+            goto done;
+        }
+        a1 = JS_ValueToAtom(ctx, v1);
+        a2 = JS_ValueToAtom(ctx, v2);
+        JS_FreeValue(ctx, v1);
+        JS_FreeValue(ctx, v2);
+        if (a1 == JS_ATOM_NULL || a2 == JS_ATOM_NULL) {
+            JS_FreeAtom(ctx, a1);
+            JS_FreeAtom(ctx, a2);
+            res = -1;
+            goto done;
+        }
+        res = (a1 == a2);
+        JS_FreeAtom(ctx, a1);
+        JS_FreeAtom(ctx, a2);
+        if (!res)
+            goto done;
+    }
+    res = 1;
+done:
+    js_free_prop_enum(ctx, tab, len);
+    return res;
+}
+
+static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name,
+                                          JSValueConst attributes)
+{
+    struct list_head *el;
+    JSModuleDef *m;
+    int eq;
+
+    /* first look at the loaded modules */
+    list_for_each(el, &ctx->loaded_modules) {
+        m = list_entry(el, JSModuleDef, link);
+        if (m->module_name == name) {
+            eq = js_module_attributes_equal(ctx, m->attributes, attributes);
+            if (eq < 0)
+                return NULL; /* exception */
+            if (eq)
+                return m;
+        }
+    }
+    return NULL;
+}
+
+static JSModuleDef *js_find_loaded_module_by_name(JSContext *ctx, JSAtom name)
 {
     struct list_head *el;
     JSModuleDef *m;
 
-    /* first look at the loaded modules */
     list_for_each(el, &ctx->loaded_modules) {
         m = list_entry(el, JSModuleDef, link);
         if (m->module_name == name)
@@ -30682,11 +30921,16 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     }
 
     /* first look at the loaded modules */
-    m = js_find_loaded_module(ctx, module_name);
+    m = js_find_loaded_module(ctx, module_name, attributes);
     if (m) {
         js_free(ctx, cname);
         JS_FreeAtom(ctx, module_name);
         return m;
+    }
+    if (JS_HasException(ctx)) {
+        js_free(ctx, cname);
+        JS_FreeAtom(ctx, module_name);
+        return NULL;
     }
 
     JS_FreeAtom(ctx, module_name);
@@ -30706,6 +30950,11 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     } else {
         m = rt->u.module_loader_func(ctx, cname, rt->module_loader_opaque);
     }
+    /* remember the attributes the module was requested with so that
+       js_find_loaded_module() can tell apart e.g. a text module and a
+       JS module with the same name */
+    if (m && JS_IsObject(attributes) && JS_IsUndefined(m->attributes))
+        m->attributes = js_dup(attributes);
     js_free(ctx, cname);
     return m;
 }
@@ -31269,6 +31518,7 @@ static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical)
         var_ref->value = JS_UNDEFINED;
     var_ref->pvalue = &var_ref->value;
     var_ref->is_detached = true;
+    var_ref->is_coro = false;
     add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
     return var_ref;
 }
@@ -31667,7 +31917,7 @@ static JSValue js_import_meta(JSContext *ctx)
 
     /* XXX: inefficient, need to add a module or script pointer in
        JSFunctionBytecode */
-    m = js_find_loaded_module(ctx, filename);
+    m = js_find_loaded_module_by_name(ctx, filename);
     JS_FreeAtom(ctx, filename);
     if (!m) {
     fail:
@@ -32321,23 +32571,17 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
 #ifndef QJS_DISABLE_PARSER
 
 /* Parse 'with { key: "value", ... }' clause for import attributes.
-   rme->attributes is set to JS_UNDEFINED if no 'with' clause or an object
-   containing the attributes as key/value pairs. If rme->attributes is already
-   set (from a previous import of the same module), we still parse the tokens
-   but skip adding to the object since they should be the same. */
-static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *rme)
+   *pattributes is set to JS_UNDEFINED if no 'with' clause or to an object
+   containing the attributes as key/value pairs. */
+static __exception int js_parse_with_clause(JSParseState *s, JSValue *pattributes)
 {
     JSContext *ctx = s->ctx;
     JSAtom key;
     int ret;
-    bool already_set;
 
+    *pattributes = JS_UNDEFINED;
     if (s->token.val != TOK_WITH)
         return 0; /* no 'with' clause */
-
-    /* If attributes already set from previous import of same module,
-       just parse to consume tokens but don't modify the object. */
-    already_set = !JS_IsUndefined(rme->attributes);
 
     if (next_token(s))
         return -1;
@@ -32368,33 +32612,31 @@ static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *r
             JS_FreeAtom(ctx, key);
             return -1;
         }
-        if (!already_set) {
-            if (JS_IsUndefined(rme->attributes)) {
-                JSValue attributes = JS_NewObjectProto(ctx, JS_NULL);
-                if (JS_IsException(attributes)) {
-                    JS_FreeAtom(ctx, key);
-                    return -1;
-                }
-                rme->attributes = attributes;
-            }
-            /* check for duplicate keys */
-            ret = JS_HasProperty(ctx, rme->attributes, key);
-            if (ret != 0) {
-                if (ret < 0) {
-                    JS_FreeAtom(ctx, key);
-                    return -1;
-                } else {
-                    js_parse_error(s, "duplicate with key");
-                    JS_FreeAtom(ctx, key);
-                    return -1;
-                }
-            }
-            ret = JS_DefinePropertyValue(ctx, rme->attributes, key,
-                                         js_dup(s->token.u.str.str), JS_PROP_C_W_E);
-            if (ret < 0) {
+        if (JS_IsUndefined(*pattributes)) {
+            JSValue attributes = JS_NewObjectProto(ctx, JS_NULL);
+            if (JS_IsException(attributes)) {
                 JS_FreeAtom(ctx, key);
                 return -1;
             }
+            *pattributes = attributes;
+        }
+        /* check for duplicate keys */
+        ret = JS_HasProperty(ctx, *pattributes, key);
+        if (ret != 0) {
+            if (ret < 0) {
+                JS_FreeAtom(ctx, key);
+                return -1;
+            } else {
+                js_parse_error(s, "duplicate with key");
+                JS_FreeAtom(ctx, key);
+                return -1;
+            }
+        }
+        ret = JS_DefinePropertyValue(ctx, *pattributes, key,
+                                     js_dup(s->token.u.str.str), JS_PROP_C_W_E);
+        if (ret < 0) {
+            JS_FreeAtom(ctx, key);
+            return -1;
         }
         JS_FreeAtom(ctx, key);
         if (next_token(s))
@@ -32405,9 +32647,9 @@ static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *r
         }
     }
     /* check attributes validity if checker function provided */
-    if (!already_set && !JS_IsUndefined(rme->attributes) &&
+    if (!JS_IsUndefined(*pattributes) &&
         ctx->rt->module_check_attrs &&
-        ctx->rt->module_check_attrs(ctx, ctx->rt->module_loader_opaque, rme->attributes) < 0) {
+        ctx->rt->module_check_attrs(ctx, ctx->rt->module_loader_opaque, *pattributes) < 0) {
         return -1;
     }
     return js_parse_expect(s, '}');
@@ -32417,6 +32659,7 @@ static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *r
 static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
 {
     JSAtom module_name;
+    JSValue attributes;
     int idx;
 
     if (!token_is_pseudo_keyword(s, JS_ATOM_from)) {
@@ -32437,14 +32680,14 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
         return -1;
     }
 
-    idx = add_req_module_entry(s->ctx, m, module_name);
-    JS_FreeAtom(s->ctx, module_name);
-    if (idx < 0)
+    if (js_parse_with_clause(s, &attributes)) {
+        JS_FreeValue(s->ctx, attributes);
+        JS_FreeAtom(s->ctx, module_name);
         return -1;
-    if (s->token.val == TOK_WITH) {
-        if (js_parse_with_clause(s, &m->req_module_entries[idx]))
-            return -1;
     }
+    idx = add_req_module_entry(s->ctx, m, module_name, attributes);
+    JS_FreeValue(s->ctx, attributes);
+    JS_FreeAtom(s->ctx, module_name);
     return idx;
 }
 
@@ -32700,6 +32943,8 @@ static __exception int js_parse_import(JSParseState *s)
 
     first_import = m->import_entries_count;
     if (s->token.val == TOK_STRING) {
+        JSValue attributes;
+
         module_name = JS_ValueToAtom(ctx, s->token.u.str.str);
         if (module_name == JS_ATOM_NULL)
             return -1;
@@ -32707,14 +32952,16 @@ static __exception int js_parse_import(JSParseState *s)
             JS_FreeAtom(ctx, module_name);
             return -1;
         }
-        idx = add_req_module_entry(ctx, m, module_name);
+        if (js_parse_with_clause(s, &attributes)) {
+            JS_FreeValue(ctx, attributes);
+            JS_FreeAtom(ctx, module_name);
+            return -1;
+        }
+        idx = add_req_module_entry(ctx, m, module_name, attributes);
+        JS_FreeValue(ctx, attributes);
         JS_FreeAtom(ctx, module_name);
         if (idx < 0)
             return -1;
-        if (s->token.val == TOK_WITH) {
-            if (js_parse_with_clause(s, &m->req_module_entries[idx]))
-                return -1;
-        }
     } else {
         if (s->token.val == TOK_IDENT) {
             if (s->token.u.ident.is_reserved) {
@@ -39868,6 +40115,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
         for(i = 0; i < m->req_module_entries_count; i++) {
             JSReqModuleEntry *rme = &m->req_module_entries[i];
             JSModuleDef **pm = &rme->module;
+            rme->attributes = JS_UNDEFINED;
             if (bc_get_atom(s, &rme->module_name))
                 goto fail;
             // Resolves a module either from the cache or by requesting
@@ -48589,14 +48837,6 @@ static uint64_t xorshift64star(uint64_t *pstate)
     return x * 0x2545F4914F6CDD1D;
 }
 
-static void js_random_init(JSContext *ctx)
-{
-    ctx->random_state = js__gettimeofday_us();
-    /* the state must be non zero */
-    if (ctx->random_state == 0)
-        ctx->random_state = 1;
-}
-
 static JSValue js_math_random(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
@@ -52938,13 +53178,13 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
     hash_float64:
         u.d = d;
         h = (u.u32[0] ^ u.u32[1]) * 3163;
-        return h ^= JS_TAG_FLOAT64;
+        tag = JS_TAG_FLOAT64;
+        break;
     default:
         h = 0;
         break;
     }
-    h ^= tag;
-    return h;
+    return h ^ ctx->hash_seed ^ hash32(tag);
 }
 
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
@@ -55087,6 +55327,11 @@ bool JS_IsPromise(JSValueConst val)
     return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_PROMISE;
 }
 
+void JS_PromiseMarkAsHandled(JSContext *ctx, JSValueConst promise)
+{
+    js_promise_set_handled(ctx, promise);
+}
+
 JSValue JS_NewSettledPromise(JSContext *ctx, bool is_reject, JSValueConst value)
 {
     return js_promise_resolve(ctx, ctx->promise_ctor, 1, &value, is_reject);
@@ -55548,6 +55793,43 @@ static JSValue js_new_promise_capability(JSContext *ctx,
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
 {
     return js_new_promise_capability(ctx, resolving_funcs, JS_UNDEFINED);
+}
+
+JSValue JS_PromiseThen(JSContext *ctx, JSValueConst promise,
+                       JSValueConst on_fulfilled,
+                       JSValueConst on_rejected)
+{
+    JSValue result_promise, resolving_funcs[2];
+    JSValueConst handlers[2] = { on_fulfilled, on_rejected };
+    JSRuntime *rt = ctx->rt;
+    JSValueLink link;
+    bool have_promise_hook;
+    int i, ret;
+
+    if (!JS_GetOpaque2(ctx, promise, JS_CLASS_PROMISE))
+        return JS_EXCEPTION;
+
+    /* Match the embedding API: create an intrinsic promise and do not consult
+       Promise.prototype.then or Symbol.species. */
+    have_promise_hook = (rt->promise_hook != NULL);
+    if (have_promise_hook) {
+        link = (JSValueLink){rt->parent_promise, promise};
+        rt->parent_promise = &link;
+    }
+    result_promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (have_promise_hook)
+        rt->parent_promise = link.next;
+    if (JS_IsException(result_promise))
+        return result_promise;
+
+    ret = perform_promise_then(ctx, promise, handlers, vc(resolving_funcs));
+    for (i = 0; i < 2; i++)
+        JS_FreeValue(ctx, resolving_funcs[i]);
+    if (ret) {
+        JS_FreeValue(ctx, result_promise);
+        return JS_EXCEPTION;
+    }
+    return result_promise;
 }
 
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
@@ -58511,7 +58793,6 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
         return -1;
 
     /* Math: create as autoinit object */
-    js_random_init(ctx);
     if (JS_SetPropertyFunctionList(ctx, ctx->global_obj, js_math_obj, countof(js_math_obj)))
         return -1;
 
@@ -60153,18 +60434,27 @@ static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
        exception is raised) */
     if (typed_array_is_oob(p) || len > p->u.array.count) {
         /* "includes" scans all the properties, so "undefined" can match */
-        if (special == special_includes)
+        if (special == special_includes) {
             if (JS_IsUndefined(argv[0]))
                 if (k < typed_array_length(p))
                     res = 0;
-        goto done;
+            goto done;
+        }
+        /* lastIndexOf scans downward, so when the buffer merely shrank
+           during argument coercion the scan continues in the still
+           valid range; the vanished indices simply cannot match */
+        if (special != special_lastIndexOf || typed_array_is_oob(p))
+            goto done;
     }
 
     // RAB may have been resized by evil .valueOf method
     len = min_int(len, p->u.array.count);
     if (len == 0)
         goto done;
-    k = min_int(k, len);
+    if (special == special_lastIndexOf)
+        k = min_int(k, len - 1);
+    else
+        k = min_int(k, len);
     stop = min_int(stop, len);
 
     is_bigint = 0;
@@ -60600,10 +60890,22 @@ static JSValue js_typed_array_slice(JSContext *ctx, JSValueConst this_val,
         if (p1 != NULL && p->class_id == p1->class_id &&
             typed_array_length(p1) >= count &&
             typed_array_length(p) >= start + count) {
+            uint8_t *src, *dst;
+            int nbytes;
             shift = typed_array_size_log2(p->class_id);
-            memmove(p1->u.array.u.uint8_ptr,
-                    p->u.array.u.uint8_ptr + (start << shift),
-                    count << shift);
+            src = p->u.array.u.uint8_ptr + (start << shift);
+            dst = p1->u.array.u.uint8_ptr;
+            nbytes = count << shift;
+            if (dst > src && dst < src + nbytes) {
+                /* per spec (step 14.g) the copy is performed byte by byte
+                   in increasing order, observable when the species
+                   constructor returns a view over the same buffer that
+                   overlaps the source ahead of it */
+                for (n = 0; n < nbytes; n++)
+                    dst[n] = src[n];
+            } else {
+                memmove(dst, src, nbytes);
+            }
         } else {
         slow_path:
             space = max_int(0, p->u.array.count - start);
@@ -60628,12 +60930,11 @@ static JSValue js_typed_array_slice(JSContext *ctx, JSValueConst this_val,
 static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
-    JSArrayBuffer *abuf;
     JSTypedArray *ta;
     JSValueConst args[4];
-    JSValue arr, byteOffset, ta_buffer;
+    JSValue arr, ta_buffer;
     JSObject *p;
-    int len, start, final, count, shift, offset;
+    int len, start, final, count, shift, offset, nargs;
 
     p = get_typed_array(ctx, this_val);
     if (!p)
@@ -60647,21 +60948,13 @@ static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
             goto exception;
     }
     count = max_int(final - start, 0);
-    byteOffset = js_typed_array_get_byteOffset(ctx, this_val);
-    if (JS_IsException(byteOffset))
-        goto exception;
     ta = p->u.typed_array;
-    abuf = ta->buffer->u.array_buffer;
-    if (ta->offset > abuf->byte_length)
-        goto range_error;
-    if (ta->offset == abuf->byte_length && count > 0) {
-    range_error:
-        JS_ThrowRangeError(ctx, "invalid offset");
-        goto exception;
-    }
     shift = typed_array_size_log2(p->class_id);
-    offset = JS_VALUE_GET_INT(byteOffset) + (start << shift);
-    JS_FreeValue(ctx, byteOffset);
+    /* per spec, read the [[ByteOffset]] slot directly: it keeps its value
+       even when the buffer was detached or resized by the argument
+       coercions above; validation is left to the constructor called by
+       TypedArraySpeciesCreate */
+    offset = ta->offset + (start << shift);
     ta_buffer = js_typed_array_get_buffer(ctx, this_val);
     if (JS_IsException(ta_buffer))
         goto exception;
@@ -60669,10 +60962,13 @@ static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
     args[1] = safe_const(ta_buffer);
     args[2] = safe_const(js_int32(offset));
     args[3] = safe_const(js_int32(count));
-    // result is length-tracking if source TA is and no explicit count is given
+    // result is length-tracking if source TA is and no explicit end is given;
+    // the constructor is then called without a length argument
     if (ta->track_rab && JS_IsUndefined(argv[1]))
-        args[3] = JS_UNDEFINED;
-    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 4, args, false);
+        nargs = 3;
+    else
+        nargs = 4;
+    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, nargs, args, false);
     JS_FreeValue(ctx, ta_buffer);
     return arr;
  exception:
@@ -63016,6 +63312,9 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int 
     if (!csd)
         return JS_EXCEPTION;
     int *field = (void *)((char *)csd + magic);
+    /* V8 returns null when the frame has no source position (native frames) */
+    if (*field < 0)
+        return JS_NULL;
     return js_int32(*field);
 }
 
