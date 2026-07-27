@@ -2245,6 +2245,65 @@ static inline JSValue js_aot_fld_obj(JSValueConst v, JSAtom atom)
     return pr->u.value;
 }
 
+/* Entry guard for a SPECULATIVE METHOD INLINE (v5.1c, phase3-aot-v5-inlining-plan.md
+   §3.2). Proves with pure reads that `recv.<atom>` is exactly the function whose body
+   tnr-aotc inlined on the typed path, and hands back THAT function's byte stream, which
+   the inlined body must use for its own atom operands (§4c: the caller's `bc` would
+   yield a plausible-but-wrong atom — a miscompile that compiles cleanly).
+
+   Three checks, all hoistable to region entry:
+
+   (a) RESOLUTION at proto depth 0 or 1, to a plain data property. The depth-1 case also
+       requires the RECEIVER's shape to be SHARED (is_hashed) — the v2 inline cache's
+       rule verbatim (see the correctness model above tnr_aot_ic_get_hit), so this
+       introduces no argument the shipped design does not already make.
+
+   (b) IDENTITY BY TWIN POINTER. `aot_func` is a link-time constant installed by
+       JS_AOTInstallTable keyed on JS_AOTFunctionHash, so `aot_func == fn` proves the
+       callee's bytecode is CONTENT-IDENTICAL to the body that was inlined — the same
+       invariant that already licenses one twin to serve every JSFunctionBytecode with
+       that hash. It fails closed: an untranslated callee has aot_func == NULL.
+
+   (c) REALM. A real call runs the callee under b->realm (js_aot_frame_enter_k); an
+       inlined body has no frame entry and would silently inherit the caller's.
+
+   NULL = deopt to the region's boxed copy, which contains the REAL call. */
+static inline const uint8_t *js_aot_inline_bc(JSContext *ctx, JSValueConst recv,
+                                              JSAtom atom, JSAOTFunc fn)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSFunctionBytecode *cb;
+    JSValue m;
+    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(recv);
+    if (p->class_id != JS_CLASS_OBJECT)
+        return NULL;
+    prs = find_own_property(&pr, p, atom);
+    if (!prs) {
+        JSObject *h = p->shape->proto;
+        if (!h || !p->shape->is_hashed)
+            return NULL;
+        prs = find_own_property(&pr, h, atom);
+        if (!prs)
+            return NULL;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return NULL;
+    m = pr->u.value;
+    if (JS_VALUE_GET_TAG(m) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(m);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return NULL;
+    cb = p->u.func.function_bytecode;
+    if (!cb || cb->aot_func != fn || cb->realm != ctx)
+        return NULL;
+    return cb->byte_code_buf;
+}
+
 /* ---- v3.5d Math intrinsics (phase3 §14.4) ------------------------------------------
    Entry guard: the global `Math` binding is pristine (not shadowed by a
    let/const global, a plain own data prop of the global object) and the method
