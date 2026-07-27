@@ -72,9 +72,83 @@ static uint64_t tnr_aot_hash_atom(uint64_t h, JSRuntime *rt, JSAtom atom)
     return tnr_aot_fnv1a(h, str8(p), p->len);
 }
 
+/* Hash one constant-pool VALUE.
+ *
+ * This was missing, and it was a live miscompile — not a theoretical one. The hash
+ * covered cpool_COUNT but not the cpool CONTENTS, while collect_cb dedupes functions by
+ * hash and region_walk bakes float constants straight into the generated C
+ * (`dstk[k] = %.17g`, from JS_AOTCpool at EMIT time). So two functions with the same
+ * opcode stream, shape and name but different constants shared one twin, and whichever
+ * was collected first supplied everybody's numbers. Minimal reproduction:
+ *
+ *     class A { f(v) { return v.x * 0.5  + v.y * 0.5  + v.z * 0.5;  } }
+ *     class B { f(v) { return v.x * 0.25 + v.y * 0.25 + v.z * 0.25; } }
+ *     // twins on: B.f(1,1,1) === 1.5   interpreter: 0.75
+ *
+ * Nothing else about the design was wrong: atoms and cpool indices are already read from
+ * the live `b` at run time, so sharing a twin is safe for everything the compiler does
+ * NOT bake. Baking is worth keeping (it is what makes a const push free), so the hash has
+ * to separate the functions instead — which is what quickjs.h already documents it as
+ * doing ("mixed with ... its constant pool — child function bytecodes hash recursively").
+ *
+ * Depth-bounded rather than trusting the nesting to be shallow: the recursion walks a
+ * function tree that comes from an input file. At the cap the child contributes its
+ * shape only, which can merge two deep subtrees — safe, because merging can only cost a
+ * missed specialization once tnr-aotc refuses to bake past the same cap (it does not
+ * recurse at all today, so nothing baked can hide down there). */
+#define TNR_AOT_HASH_MAX_DEPTH 8
+
+static uint64_t tnr_aot_fn_hash(JSRuntime *rt, JSFunctionBytecode *b, int depth);
+
+static uint64_t tnr_aot_hash_cpool_val(uint64_t h, JSRuntime *rt, JSValueConst v,
+                                       int depth)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+    h = tnr_aot_hash_u32(h, (uint32_t)tag);
+    if (JS_TAG_IS_FLOAT64(tag)) {
+        /* the bit pattern, so -0.0 != 0.0 and every NaN payload is itself; this is the
+           case that actually bit us */
+        double d = JS_VALUE_GET_FLOAT64(v);
+        return tnr_aot_fnv1a(h, &d, sizeof d);
+    }
+    switch (tag) {
+    case JS_TAG_INT:
+        return tnr_aot_hash_u32(h, (uint32_t)JS_VALUE_GET_INT(v));
+    case JS_TAG_BOOL:
+        return tnr_aot_hash_u32(h, (uint32_t)JS_VALUE_GET_BOOL(v));
+    case JS_TAG_NULL:
+    case JS_TAG_UNDEFINED:
+    case JS_TAG_UNINITIALIZED:
+        return h;
+    case JS_TAG_STRING: {
+        JSString *s = JS_VALUE_GET_STRING(v);
+        h = tnr_aot_hash_u32(h, s->len);
+        if (s->is_wide_char)
+            return tnr_aot_fnv1a(h, str16(s), (size_t)s->len * 2);
+        return tnr_aot_fnv1a(h, str8(s), s->len);
+    }
+    case JS_TAG_FUNCTION_BYTECODE: {
+        uint64_t ch;
+        if (depth >= TNR_AOT_HASH_MAX_DEPTH)
+            return tnr_aot_hash_u32(h, 0xdeeeeeedu);
+        ch = tnr_aot_fn_hash(rt, JS_VALUE_GET_PTR(v), depth + 1);
+        return tnr_aot_fnv1a(h, &ch, sizeof ch);
+    }
+    default:
+        /* Anything else (module refs, bigints, ...) contributes its tag only. A twin
+           never bakes such a value — every baked constant is a float64 push — so a
+           merge here costs nothing but a shared twin that reads the value from `b`. */
+        return h;
+    }
+}
+
 uint64_t JS_AOTFunctionHash(JSContext *ctx, JSFunctionBytecode *b)
 {
-    JSRuntime *rt = ctx->rt;
+    return tnr_aot_fn_hash(ctx->rt, b, 0);
+}
+
+static uint64_t tnr_aot_fn_hash(JSRuntime *rt, JSFunctionBytecode *b, int depth)
+{
     uint64_t h = TNR_AOT_FNV_INIT;
 
     /* shape */
@@ -122,6 +196,14 @@ uint64_t JS_AOTFunctionHash(JSContext *ctx, JSFunctionBytecode *b)
             }
             pc += size;
         }
+    }
+
+    /* constant pool VALUES — see tnr_aot_hash_cpool_val. cpool_count is hashed above,
+       so an empty pool costs nothing here. */
+    {
+        int i;
+        for (i = 0; i < b->cpool_count; i++)
+            h = tnr_aot_hash_cpool_val(h, rt, b->cpool[i], depth);
     }
     return h;
 }
@@ -1090,6 +1172,13 @@ uint8_t **JS_AOTFramePCSlot(JSAOTFrame *frame)
 int JS_AOTPoll(JSContext *ctx)
 {
     return js_poll_interrupts(ctx) ? -1 : 0;
+}
+
+/* Reports the hash ABI of THIS library, so tnr-aotc can bake it into the generated file
+   and the runtime can static_assert against it. See the JS_AOT_HASH_ABI comment. */
+int JS_AOTHashAbi(void)
+{
+    return JS_AOT_HASH_ABI;
 }
 
 JSValue JS_AOTCpool(JSFunctionBytecode *b, int idx)

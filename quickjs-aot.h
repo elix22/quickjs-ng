@@ -93,6 +93,33 @@ JS_EXTERN uint8_t **JS_AOTFramePCSlot(JSAOTFrame *frame);
    Returns -1 (exception pending) when the interrupt handler fired. */
 JS_EXTERN int JS_AOTPoll(JSContext *ctx);
 
+/* ---- content-hash ABI --------------------------------------------------------------
+   tnr-aotc writes the twin table keyed by JS_AOTFunctionHash; the runtime looks twins up
+   with its OWN copy of that function. If the two disagree, every bsearch misses and
+   ZERO twins install — and nothing fails: the differential gate then compares the
+   interpreter with itself and reports "bit-identical", while the benchmark quietly loses
+   the whole AOT speedup. That is the worst failure shape this project has, so it is made
+   a BUILD error instead.
+
+   The two can disagree for a mundane reason: TNR_AOT_C forces the runtime from source,
+   but tnr_aotc links the PREBUILT libqjs from libs/qjs (pinned in libs.lock.json) unless
+   TNR_QJS_FROM_SOURCE=ON. So a hash change is not complete until the prebuilt is rebuilt
+   and re-pinned — see scripts/prebuilt/PINNED_COMMIT.
+
+   Mechanism: tnr-aotc calls JS_AOTHashAbi() (resolved from the library it LINKS) and
+   emits the answer as a literal; the generated file is compiled inside quickjs.c's TU, so
+   the assert below compares the tool's library against the runtime's. A prebuilt too old
+   to have the symbol fails to link, which is equally loud.
+
+   BUMP THIS whenever JS_AOTFunctionHash's output changes for any input.
+     1 — original: shape + opcode stream (atoms normalized)
+     2 — 2026-07-27: + constant-pool VALUES, children recursively (Merkle). Without it
+         two functions differing only in their constants shared one twin, and region_walk
+         bakes float constants at emit time: `class A { f(v){return v.x*0.5;} }` and
+         `class B { f(v){return v.x*0.25;} }` both computed with 0.5. */
+#define JS_AOT_HASH_ABI 2
+JS_EXTERN int JS_AOTHashAbi(void);
+
 /* ---- operand access ---------------------------------------------------------------- */
 static inline JSAtom JS_AOTAtom(const uint8_t *bc, int off) {
     uint32_t v;
