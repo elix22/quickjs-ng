@@ -11,8 +11,11 @@ on:
       - '!examples/**'
       - '.github/workflows/ci.yml'
   push:
+    # FORK CHANGE: `tnr` is this fork's single project branch, so it is the only branch
+    # whose pushes are worth testing. Upstream ships `master` here; expect this two-line
+    # block to be the conflict whenever upstream edits its own trigger, and keep `tnr`.
     branches:
-      - master
+      - tnr
     paths:
       - '**'
       - '!.gitignore'

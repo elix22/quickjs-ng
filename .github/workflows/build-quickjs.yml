@@ -1,20 +1,34 @@
 # Build prebuilt libqjs for the threejs-native-runtime SDK (phase12 P12.6).
 #
-# Builds the PINNED commit (scripts/prebuilt/PINNED_COMMIT) — the exact quickjs-ng
-# fork commit whose headers the runtime host compiles against, debugger patches
-# included. Three variants per artifact: release (-O2, interpreter), debug (-O0),
-# debug-dbg (-O0 + TNR_QJS_DEBUGGER = the DAP engine). No AOT twins are ever baked
-# in (they must compile inside quickjs.c's TU at the runtime's build time).
+# Builds THE PUSHED COMMIT of `tnr`, which is this fork's single project branch —
+# everything the runtime uses lives there, and upstream `master` is merged into it
+# periodically. Three variants per artifact: release (-O2, interpreter), debug (-O0),
+# debug-dbg (-O0 + TNR_QJS_DEBUGGER = the DAP engine).
+#
+# THE PREBUILTS ARE INTERPRETER-ONLY, BY CONSTRUCTION. No AOT twins are ever baked in:
+# twins are #included into quickjs.c's own TU at the *runtime's* build time, so an
+# archive compiled once here can never carry them. AOT builds compile quickjs from
+# source locally; these artifacts exist to serve the DEBUGGER and the cross-compiled
+# SDK targets, which want a fetch instead of an 8s engine compile.
 #
 # Artifacts publish to a permanent GitHub RELEASE (tag prebuilt-<shortsha>); the
 # runtime pins each asset's sha256 in libs.lock.json and fetches it into libs/qjs/.
+#
+# WAS: a separate scripts/prebuilt/PINNED_COMMIT named the commit to build, which made
+# a THIRD record of "which quickjs this project uses" — alongside the parent repo's
+# submodule pointer and libs.lock.json's tag — and the three could (and did) disagree.
+# The branch head is now the only such record; the submodule pointer selects it.
 name: Build QuickJS Libraries
 
 on:
   workflow_dispatch:
   push:
-    branches: [tnr-prebuilt]
+    branches: [tnr]
+    # Engine sources only: a docs/test-only push must not spend a 5-platform build.
     paths:
+      - '**.c'
+      - '**.h'
+      - 'CMakeLists.txt'
       - 'scripts/prebuilt/**'
       - '.github/workflows/build-quickjs.yml'
 
@@ -39,17 +53,13 @@ jobs:
           - { name: linux,   os: ubuntu-latest,  script: build-linux.sh,   asset: qjs-linux-x64.tar.gz }
           - { name: windows, os: windows-latest, script: build-windows.sh, asset: qjs-windows-x64.tar.gz }
     steps:
-      - name: Checkout scripts (this branch, sparse — source comes at the pin below)
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            scripts/prebuilt
-          path: tools-main
-
-      - name: Read pinned QuickJS commit
+      # The commit being built IS the commit that triggered this run, so it is known
+      # before any checkout — which lets the already-published probe below run first
+      # and skip the clone entirely on a no-op re-run.
+      - name: Identify the commit to build
         id: pin
         run: |
-          SHA=$(tr -d '[:space:]' < tools-main/scripts/prebuilt/PINNED_COMMIT)
+          SHA="${{ github.sha }}"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short=${SHA:0:9}" >> "$GITHUB_OUTPUT"
 
@@ -66,7 +76,9 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout pinned QuickJS source
+      # One checkout, not two: it carries both the engine source AND the build scripts,
+      # because they are now the same commit by construction.
+      - name: Checkout QuickJS source + build scripts
         if: steps.published.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
@@ -81,7 +93,7 @@ jobs:
 
       - name: Build
         if: steps.published.outputs.skip != 'true'
-        run: bash tools-main/scripts/prebuilt/${{ matrix.script }} "$PWD/qjs-src" "$PWD/out"
+        run: bash qjs-src/scripts/prebuilt/${{ matrix.script }} "$PWD/qjs-src" "$PWD/out"
 
       - name: Upload build artifact (90-day convenience copy)
         if: steps.published.outputs.skip != 'true'
@@ -100,7 +112,7 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "QuickJS prebuilt ($TAG)" \
-              --notes "Prebuilt libqjs (release / debug / debug-dbg variants) at pinned commit ${{ steps.pin.outputs.sha }}. For threejs-native-runtime phase12 P12.6. Produced by build-quickjs.yml."
+              --notes "Prebuilt libqjs (release / debug / debug-dbg variants) built from \`tnr\` at ${{ steps.pin.outputs.sha }}. INTERPRETER-ONLY (no AOT twins - those compile into quickjs.c's TU at the runtime's build time). For threejs-native-runtime phase12 P12.6. Produced by build-quickjs.yml."
           # First publish wins: the runtime pins each asset's sha256, so a re-upload
           # (new bytes) would break every clone that fetched the pin. Delete an asset
           # by hand only to deliberately republish, then re-pin the lock.

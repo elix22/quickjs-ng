@@ -104,7 +104,8 @@ JS_EXTERN int JS_AOTPoll(JSContext *ctx);
    The two can disagree for a mundane reason: TNR_AOT_C forces the runtime from source,
    but tnr_aotc links the PREBUILT libqjs from libs/qjs (pinned in libs.lock.json) unless
    TNR_QJS_FROM_SOURCE=ON. So a hash change is not complete until the prebuilt is rebuilt
-   and re-pinned — see scripts/prebuilt/PINNED_COMMIT.
+   and re-pinned: push the change to `tnr` (build-quickjs.yml builds the pushed commit
+   and publishes prebuilt-<shortsha>), then run tools/pin-libs.mjs in the runtime repo.
 
    Mechanism: tnr-aotc calls JS_AOTHashAbi() (resolved from the library it LINKS) and
    emits the answer as a literal; the generated file is compiled inside quickjs.c's TU, so
