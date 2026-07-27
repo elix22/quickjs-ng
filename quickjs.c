@@ -17995,6 +17995,12 @@ static bool needs_backtrace(JSValue exc)
     return can_store_error_stack(exc) || can_add_backtrace(exc);
 }
 
+#ifdef TNR_AOT_PROFILE_COLLECT
+/* Defined in quickjs-aot.c, which is textually included at the END of this file, so
+   the one call below (at the AOT dispatch anchor) needs the prototype here. */
+static void tnr_prof_note_call(JSFunctionBytecode *b);
+#endif
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -18112,6 +18118,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        translator rejects, so they never have twins. Generators resume
        mid-frame and COPY_ARGV callers own const argv (twins ALIAS argv when
        argc >= arg_count) — both must always interpret. */
+#ifdef TNR_AOT_PROFILE_COLLECT
+    /* v4.1 training only, compiled out otherwise. Counts frames the TWIN path never
+       sees, so "never executed" in the profile means never executed — not merely
+       "has no twin". Deliberately placed at this existing anchor rather than adding
+       a fourth one (doctrine #5). */
+    tnr_prof_note_call(b);
+#endif
     if (unlikely(b->aot_func != NULL) &&
         !(flags & (JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_COPY_ARGV))) {
         return b->aot_func(caller_ctx, func_obj, this_obj, new_target, argc,

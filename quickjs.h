@@ -1315,6 +1315,16 @@ JS_EXTERN void JS_AOTGetShape(const JSFunctionBytecode *b, JSAOTShape *shape);
 /* Function name for logs (caller frees with JS_FreeCString); NULL if anonymous. */
 JS_EXTERN const char *JS_AOTGetFuncName(JSContext *ctx, const JSFunctionBytecode *b);
 
+/* v4.1 profile collector (phase3-aot-v4-profile-guided-plan.md §4) — BUILD-TIME
+   TRAINING ONLY. Real bodies exist only when the engine is compiled with
+   -DTNR_AOT_PROFILE_COLLECT; otherwise these link as no-ops returning 0, so the
+   host calls them unconditionally and a shipping build carries nothing.
+   Init also requires TNR_AOT_PROFILE=1 in the environment, so even a
+   collector-enabled binary is inert until asked. */
+JS_EXTERN int JS_AOTProfileInit(JSContext *ctx);
+JS_EXTERN int JS_AOTProfileRegisterBundle(JSContext *ctx, JSValueConst root);
+JS_EXTERN int JS_AOTProfileDump(JSContext *ctx, const char *path, const char *bundle);
+
 /* only exported for os.Worker() */
 JS_EXTERN JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
 /* only exported for os.Worker() */

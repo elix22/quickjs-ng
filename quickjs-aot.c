@@ -126,6 +126,254 @@ uint64_t JS_AOTFunctionHash(JSContext *ctx, JSFunctionBytecode *b)
     return h;
 }
 
+/* ==== v4.1 profile collector (phase3-aot-v4-profile-guided-plan.md §4) ===============
+   BUILD-TIME TRAINING ONLY. Every byte of this is inside TNR_AOT_PROFILE_COLLECT and
+   compiles to nothing in a shipping build (§4.3). Configure with
+   `cmake -DCMAKE_C_FLAGS=-DTNR_AOT_PROFILE_COLLECT ...` — no CMakeLists change needed.
+
+   WHAT IT OBSERVES, and why here rather than in the interpreter's dispatch loop:
+   v3 doctrine #5 caps the fork surface at quickjs.c's three anchors. So collection
+   hangs off code that is ALREADY in this file — JS_AOTFrameEnter (every twin call),
+   js_aot_fld_slot (every v3.4 field-region entry guard) and the v2 field ICs — plus
+   ONE guarded line at quickjs.c's existing dispatch anchor to count interpreter
+   frames. Nothing here changes what tnr-aotc emits: v4.1's gate is that regenerated
+   twins byte-diff identical, so the collector may not require new arguments at any
+   emission site. That is why attribution walks rt->current_stack_frame instead of
+   taking a site id (§8 v4.1).
+
+   HONEST COVERAGE LIMIT, stated because §3.3.3 makes "unobserved" a first-class
+   outcome: a field read that happens inside a typed region body goes through the
+   region's slot pointer and is NOT re-observed — only the ENTRY GUARD is. So the
+   field records describe "what the guard saw when the region was entered", which is
+   exactly the question v4.2 asks, but it is not a complete dynamic type census.
+ */
+#ifdef TNR_AOT_PROFILE_COLLECT
+
+/* Mirrors tnr-aotc.c's TY_* lattice so a recorded tag means the same thing on both
+   sides. Meet biases to OTHER (= boxed), same as ty_meet. */
+enum { TNR_PT_BOT = 0, TNR_PT_INT32, TNR_PT_FLOAT64, TNR_PT_NUMBER, TNR_PT_OTHER };
+
+static int tnr_pt_meet(int a, int b)
+{
+    if (a == TNR_PT_BOT) return b;
+    if (b == TNR_PT_BOT) return a;
+    if (a == b) return a;
+    if (a != TNR_PT_OTHER && b != TNR_PT_OTHER) return TNR_PT_NUMBER;
+    return TNR_PT_OTHER;
+}
+
+static int tnr_pt_of(JSValueConst v)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+    if (tag == JS_TAG_INT) return TNR_PT_INT32;
+    if (JS_TAG_IS_FLOAT64(tag)) return TNR_PT_FLOAT64;
+    return TNR_PT_OTHER;
+}
+
+static const char *tnr_pt_name(int t)
+{
+    switch (t) {
+    case TNR_PT_INT32:   return "i32";
+    case TNR_PT_FLOAT64: return "f64";
+    case TNR_PT_NUMBER:  return "num";
+    case TNR_PT_BOT:     return "bot";
+    default:             return "any";
+    }
+}
+
+#define TNR_PROF_MAX_SHAPES 4    /* more distinct receiver shapes than this = polymorphic */
+#define TNR_PROF_MAX_FIELDS 24   /* per function; overflow is recorded, not silently cut */
+#define TNR_PROF_BUCKETS    4096 /* power of two */
+
+typedef struct TnrProfField {
+    JSAtom   atom;
+    int      ty;                 /* running meet of observed value types */
+    uint64_t obs;                /* times the guard looked at this field */
+    uint64_t miss;               /* ...of which the guard REJECTED (deopt) */
+    uint64_t ty_change;          /* times the meet widened — bimodality signal (§3.2) */
+    void    *shapes[TNR_PROF_MAX_SHAPES];
+    uint8_t  nshapes;
+    uint8_t  shape_overflow;     /* saw > MAX distinct shapes => megamorphic */
+} TnrProfField;
+
+typedef struct TnrProfFn {
+    struct TnrProfFn *next;
+    JSFunctionBytecode *fb;      /* run-local identity (the hash table key) */
+    uint64_t hash;               /* JS_AOTFunctionHash — the PROFILE key (§4.1) */
+    uint64_t calls;
+    uint64_t guard_hit, guard_miss;
+    TnrProfField fields[TNR_PROF_MAX_FIELDS];
+    uint8_t  nfields, field_overflow;
+    char     name[64];
+    char     loc[96];            /* "file:line" — see the <anon> note in tnr_prof_intern */
+} TnrProfFn;
+
+static TnrProfFn  *g_prof_tab[TNR_PROF_BUCKETS];
+static JSRuntime  *g_prof_rt;        /* single-threaded by construction (see IC note) */
+static JSContext  *g_prof_ctx;
+static int         g_prof_on;
+static uint64_t    g_prof_registered, g_prof_oom;
+
+/* Two DIFFERENT functions that hash equal share one profile record (§4.1: cpool
+   VALUES are deliberately not hashed). Doctrine #1 keeps that safe — a merged
+   record is a hint and the guard tests reality — but §11 Q5 asks whether it happens
+   at all on real bundles, so it is counted rather than assumed. */
+static uint64_t g_prof_hash_collisions;
+
+static TnrProfFn *tnr_prof_find(JSFunctionBytecode *fb)
+{
+    size_t h = ((uintptr_t)fb >> 4) & (TNR_PROF_BUCKETS - 1);
+    TnrProfFn *f;
+    for (f = g_prof_tab[h]; f; f = f->next)
+        if (f->fb == fb)
+            return f;
+    return NULL;
+}
+
+static TnrProfFn *tnr_prof_intern(JSFunctionBytecode *fb)
+{
+    size_t h;
+    TnrProfFn *f;
+    if (!g_prof_on || !fb)
+        return NULL;
+    if ((f = tnr_prof_find(fb)) != NULL)
+        return f;
+    f = calloc(1, sizeof *f);
+    if (!f) { g_prof_oom++; return NULL; }
+    f->fb = fb;
+    f->hash = g_prof_ctx ? JS_AOTFunctionHash(g_prof_ctx, fb) : 0;
+    if (g_prof_ctx) {
+        const char *nm = JS_AOTGetFuncName(g_prof_ctx, fb);
+        /* §0.2's caveat: tnr-aotc's static report shows 228/242 fns as <anon>, which
+           makes its distribution unattributable. The profile carries the name so
+           v4.1's deliverable does not inherit that. */
+        if (nm) {
+            size_t n = strlen(nm);
+            if (n >= sizeof f->name) n = sizeof f->name - 1;
+            memcpy(f->name, nm, n);
+            f->name[n] = '\0';
+            JS_FreeCString(g_prof_ctx, nm);
+        }
+        /* three.js class methods are shorthand, so func_name is empty for exactly the
+           functions that matter (the static report shows 228/242 as <anon>). file:line
+           is what makes a record actionable — without it the distribution names nothing. */
+        if (fb->filename != JS_ATOM_NULL) {
+            const char *fn = JS_AtomToCString(g_prof_ctx, fb->filename);
+            if (fn) {
+                const char *base = strrchr(fn, '/');
+                snprintf(f->loc, sizeof f->loc, "%s:%d", base ? base + 1 : fn,
+                         fb->line_num);
+                JS_FreeCString(g_prof_ctx, fn);
+            }
+        }
+    }
+    h = ((uintptr_t)fb >> 4) & (TNR_PROF_BUCKETS - 1);
+    f->next = g_prof_tab[h];
+    g_prof_tab[h] = f;
+    g_prof_registered++;
+    return f;
+}
+
+/* The currently executing bytecode function. Both the interpreter and twins keep
+   rt->current_stack_frame accurate (JS_AOTFrameEnter/Leave maintain it), so this
+   needs no shadow stack and no emission change. */
+static TnrProfFn *tnr_prof_cur(void)
+{
+    JSStackFrame *sf;
+    JSObject *p;
+    if (!g_prof_on || !g_prof_rt)
+        return NULL;
+    sf = g_prof_rt->current_stack_frame;
+    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return NULL;
+    return tnr_prof_intern(p->u.func.function_bytecode);
+}
+
+static void tnr_prof_note_call(JSFunctionBytecode *b)
+{
+    TnrProfFn *f = tnr_prof_intern(b);
+    if (f) f->calls++;
+}
+
+/* One field-guard observation, attributed to the function that ran the guard.
+   `slot` is NULL when the guard REJECTED — that is the datum §3.2 cares about most,
+   so a miss is recorded with the shape that caused it, not dropped. */
+static void tnr_prof_note_field(JSValueConst obj, JSAtom atom, const JSValue *slot)
+{
+    TnrProfFn *f = tnr_prof_cur();
+    TnrProfField *fl;
+    void *shape = NULL;
+    int i, ty, newty;
+
+    if (!f)
+        return;
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+        shape = JS_VALUE_GET_OBJ(obj)->shape;
+
+    for (i = 0; i < f->nfields; i++)
+        if (f->fields[i].atom == atom)
+            break;
+    if (i == f->nfields) {
+        if (f->nfields >= TNR_PROF_MAX_FIELDS) { f->field_overflow = 1; return; }
+        f->nfields++;
+        f->fields[i].atom = atom;
+        f->fields[i].ty = TNR_PT_BOT;
+    }
+    fl = &f->fields[i];
+    fl->obs++;
+
+    if (slot) {
+        f->guard_hit++;
+        ty = tnr_pt_of(*slot);
+        newty = tnr_pt_meet(fl->ty, ty);
+        if (fl->ty != TNR_PT_BOT && newty != fl->ty) fl->ty_change++;
+        fl->ty = newty;
+    } else {
+        f->guard_miss++;
+        fl->miss++;
+    }
+
+    if (shape && !fl->shape_overflow) {
+        for (i = 0; i < fl->nshapes; i++)
+            if (fl->shapes[i] == shape)
+                return;
+        if (fl->nshapes >= TNR_PROF_MAX_SHAPES) { fl->shape_overflow = 1; return; }
+        /* Hold a REFERENCE, exactly as the v2 ICs do and for the same reason: a raw
+           JSShape* can be freed and its address reused, so an unreferenced pointer set
+           silently aliases two different shapes (ABA). That made the distinct-shape
+           count vary run to run and broke doctrine #10's byte-equality gate — caught by
+           --check, which is the whole point of having it. Released in tnr_prof_release. */
+        fl->shapes[fl->nshapes++] = js_dup_shape((JSShape *)shape);
+    }
+}
+
+/* Drop the shape references taken above. Must run before JS_FreeRuntime or its leak
+   accounting fires — the dump calls this, and the dump runs at engine dispose. */
+static void tnr_prof_release(JSRuntime *rt)
+{
+    size_t b;
+    int i, j;
+    for (b = 0; b < TNR_PROF_BUCKETS; b++)
+        for (TnrProfFn *f = g_prof_tab[b]; f; f = f->next)
+            for (i = 0; i < f->nfields; i++) {
+                for (j = 0; j < f->fields[i].nshapes; j++)
+                    if (f->fields[i].shapes[j])
+                        js_free_shape(rt, (JSShape *)f->fields[i].shapes[j]);
+                f->fields[i].nshapes = 0;
+            }
+}
+
+#define TNR_PROF_NOTE_CALL(b)               tnr_prof_note_call(b)
+#define TNR_PROF_NOTE_FIELD(o, a, s)        tnr_prof_note_field(o, a, s)
+
+#else /* !TNR_AOT_PROFILE_COLLECT — shipping build: nothing at all */
+#define TNR_PROF_NOTE_CALL(b)               ((void)0)
+#define TNR_PROF_NOTE_FIELD(o, a, s)        ((void)0)
+#endif /* TNR_AOT_PROFILE_COLLECT */
+
 static int tnr_aot_walk(JSContext *ctx, JSFunctionBytecode *b,
                         JSAOTEnumFunc cb, void *ud)
 {
@@ -207,6 +455,229 @@ int JS_AOTInstallTable(JSContext *ctx, JSValueConst root,
     return ic.installed;
 }
 
+/* ==== v4.1 profile collector — public surface ======================================= */
+#ifdef TNR_AOT_PROFILE_COLLECT
+
+static void tnr_prof_register_cb(void *ud, JSContext *ctx, JSFunctionBytecode *b,
+                                 uint64_t hash)
+{
+    (void)ud; (void)ctx; (void)hash;
+    tnr_prof_intern(b);      /* calls stays 0 => "never executed", §3.3.3 */
+}
+
+int JS_AOTProfileInit(JSContext *ctx)
+{
+    const char *on = getenv("TNR_AOT_PROFILE");
+    if (!on || !on[0] || on[0] == '0')
+        return 0;
+    g_prof_ctx = ctx;
+    g_prof_rt  = JS_GetRuntime(ctx);
+    g_prof_on  = 1;
+    return 1;
+}
+
+/* Pre-register EVERY function in the bundle so "never executed" is a real category
+   rather than an absence (§3.3.3: "train more" and "genuinely polymorphic, stop
+   trying" want different responses, and conflating them wastes a week). */
+int JS_AOTProfileRegisterBundle(JSContext *ctx, JSValueConst root)
+{
+    if (!g_prof_on)
+        return 0;
+    return JS_AOTEnumFunctions(ctx, root, tnr_prof_register_cb, NULL);
+}
+
+/* Sort by hash, then by CONTENT (loc, then name). The content tie-break is what makes
+   the dump reproducible: records are interned by JSFunctionBytecode POINTER, so a run
+   of equal-hash records would otherwise be ordered by malloc addresses and doctrine
+   #10's byte-equality gate would fail under ASLR. Observed, not theorized — the first
+   --check run failed exactly this way. */
+static int tnr_prof_cmp(const void *a, const void *b)
+{
+    const TnrProfFn *x = *(TnrProfFn *const *)a, *y = *(TnrProfFn *const *)b;
+    int c;
+    if (x->hash < y->hash) return -1;
+    if (x->hash > y->hash) return  1;
+    if ((c = strcmp(x->loc,  y->loc))  != 0) return c;
+    return strcmp(x->name, y->name);
+}
+
+/* §4.1: two DIFFERENT functions can share a hash, because cpool VALUES are
+   deliberately not hashed. They must be merged with the LATTICE, not last-write-wins —
+   otherwise the surviving record is a lie about the other function, and (as the
+   dump is keyed by hash) which one survives is arbitrary. Merging is what makes a
+   colliding record safely weaker rather than confidently wrong. */
+static void tnr_prof_merge(TnrProfFn *dst, const TnrProfFn *src)
+{
+    int i, j;
+    dst->calls      += src->calls;
+    dst->guard_hit  += src->guard_hit;
+    dst->guard_miss += src->guard_miss;
+    dst->field_overflow |= src->field_overflow;
+    for (i = 0; i < src->nfields; i++) {
+        const TnrProfField *s = &src->fields[i];
+        TnrProfField *d = NULL;
+        for (j = 0; j < dst->nfields; j++)
+            if (dst->fields[j].atom == s->atom) { d = &dst->fields[j]; break; }
+        if (!d) {
+            if (dst->nfields >= TNR_PROF_MAX_FIELDS) { dst->field_overflow = 1; continue; }
+            d = &dst->fields[dst->nfields++];
+            *d = *s;
+            continue;
+        }
+        d->ty = tnr_pt_meet(d->ty, s->ty);
+        d->obs       += s->obs;
+        d->miss      += s->miss;
+        d->ty_change += s->ty_change;
+        d->shape_overflow |= s->shape_overflow;
+        /* Distinct-shape counts cannot be unioned across records (the pointers are
+           per-object). Take the max and, when both saw shapes, treat the merge itself
+           as evidence of >1 shape — the conservative direction, which costs a hint
+           rather than emitting a wrong one. */
+        if (d->nshapes && s->nshapes && d->nshapes < TNR_PROF_MAX_SHAPES)
+            d->nshapes = (uint8_t)(d->nshapes + 1);
+        if (s->nshapes > d->nshapes) d->nshapes = s->nshapes;
+    }
+}
+
+static void tnr_prof_json_str(FILE *fp, const char *s)
+{
+    fputc('"', fp);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { fputc('\\', fp); fputc(c, fp); }
+        else if (c < 0x20)         fprintf(fp, "\\u%04x", c);
+        else                       fputc(c, fp);
+    }
+    fputc('"', fp);
+}
+
+int JS_AOTProfileDump(JSContext *ctx, const char *path, const char *bundle)
+{
+    FILE *fp;
+    TnrProfFn **all, *f;
+    size_t n = 0, i;
+    uint64_t executed = 0, never = 0, hinted = 0, polymorphic = 0, mono_hot = 0;
+    size_t b;
+
+    if (!g_prof_on)
+        return 0;
+    all = calloc(g_prof_registered ? g_prof_registered : 1, sizeof *all);
+    if (!all)
+        return -1;
+    for (b = 0; b < TNR_PROF_BUCKETS; b++)
+        for (f = g_prof_tab[b]; f; f = f->next)
+            if (n < g_prof_registered) all[n++] = f;
+    qsort(all, n, sizeof *all, tnr_prof_cmp);
+    /* Collapse equal-hash runs into their first (content-sorted) representative, so the
+       file has one record per PROFILE KEY and the merge is the lattice meet (§4.1).
+       g_prof_hash_collisions is the answer to §11 Q5 — does this happen in practice. */
+    {
+        size_t w = 0;
+        for (i = 0; i < n; i++) {
+            if (w > 0 && all[w - 1]->hash == all[i]->hash) {
+                g_prof_hash_collisions++;
+                tnr_prof_merge(all[w - 1], all[i]);
+            } else {
+                all[w++] = all[i];
+            }
+        }
+        n = w;
+    }
+
+    fp = fopen(path, "wb");
+    if (!fp) { free(all); return -1; }
+
+    /* Sorted + pretty-printed so a regeneration diffs reviewably rather than
+       reordering (§4.2), and so doctrine #10's byte-equality gate is meaningful. */
+    fprintf(fp, "{\n  \"bundle\": ");
+    tnr_prof_json_str(fp, bundle ? bundle : "");
+    fprintf(fp, ",\n  \"aotcVersion\": 4,\n  \"schema\": 1,\n");
+
+    for (i = 0; i < n; i++) {
+        f = all[i];
+        if (f->calls) executed++; else never++;
+        if (f->nfields) {
+            int mono = 1, j;
+            for (j = 0; j < f->nfields; j++)
+                if (f->fields[j].shape_overflow || f->fields[j].nshapes > 1 ||
+                    f->fields[j].ty == TNR_PT_OTHER)
+                    mono = 0;
+            if (mono) { hinted++; if (f->calls >= 1000) mono_hot++; }
+            else polymorphic++;
+        }
+    }
+    fprintf(fp,
+            "  \"coverage\": { \"fnsTotal\": %zu, \"fnsExecuted\": %llu, "
+            "\"fnsNeverExecuted\": %llu, \"fnsHintable\": %llu, "
+            "\"fnsPolymorphic\": %llu, \"fnsHintableAndHot\": %llu, "
+            "\"hashCollisions\": %llu, \"allocFailures\": %llu },\n",
+            n, (unsigned long long)executed, (unsigned long long)never,
+            (unsigned long long)hinted, (unsigned long long)polymorphic,
+            (unsigned long long)mono_hot,
+            (unsigned long long)g_prof_hash_collisions,
+            (unsigned long long)g_prof_oom);
+
+    fprintf(fp, "  \"fns\": {\n");
+    {
+    int wrote_any = 0;
+    for (i = 0; i < n; i++) {
+        int j, first = 1;
+        f = all[i];
+        if (!f->calls && !f->nfields)
+            continue;            /* never executed and nothing observed — absent = no hint */
+        /* Separator goes BEFORE the entry: entries are skipped above, so keying the
+           comma off the loop index writes a trailing one and the file stops parsing. */
+        if (wrote_any) fprintf(fp, ",\n");
+        wrote_any = 1;
+        fprintf(fp, "    \"0x%016llx\": { \"name\": ", (unsigned long long)f->hash);
+        tnr_prof_json_str(fp, f->name);
+        fprintf(fp, ", \"loc\": ");
+        tnr_prof_json_str(fp, f->loc);
+        fprintf(fp, ", \"calls\": %llu, \"guardHit\": %llu, \"guardMiss\": %llu",
+                (unsigned long long)f->calls, (unsigned long long)f->guard_hit,
+                (unsigned long long)f->guard_miss);
+        fprintf(fp, ", \"fieldOverflow\": %d, \"fields\": {", f->field_overflow);
+        for (j = 0; j < f->nfields; j++) {
+            TnrProfField *fl = &f->fields[j];
+            const char *nm = JS_AtomToCString(ctx, fl->atom);
+            if (!first) fputc(',', fp);
+            first = 0;
+            fprintf(fp, "\n      ");
+            tnr_prof_json_str(fp, nm ? nm : "?");
+            if (nm) JS_FreeCString(ctx, nm);
+            fprintf(fp, ": { \"ty\": \"%s\", \"obs\": %llu, \"miss\": %llu, "
+                        "\"tyChanges\": %llu, \"shapes\": %d, \"shapeOverflow\": %d }",
+                    tnr_pt_name(fl->ty), (unsigned long long)fl->obs,
+                    (unsigned long long)fl->miss, (unsigned long long)fl->ty_change,
+                    fl->nshapes, fl->shape_overflow);
+        }
+        fprintf(fp, "%s}", first ? "" : "\n    ");
+        fprintf(fp, " }");
+    }
+    fprintf(fp, "%s  }\n}\n", wrote_any ? "\n" : "");
+    }
+    fclose(fp);
+
+    fprintf(stderr,
+            "[aot-profile] %zu fns: %llu executed, %llu never; %llu stable-shape, "
+            "%llu polymorphic, %llu stable+hot(>=1k calls); %llu hash collisions -> %s\n",
+            n, (unsigned long long)executed, (unsigned long long)never,
+            (unsigned long long)hinted, (unsigned long long)polymorphic,
+            (unsigned long long)mono_hot,
+            (unsigned long long)g_prof_hash_collisions, path);
+    free(all);
+    tnr_prof_release(JS_GetRuntime(ctx));
+    return (int)n;
+}
+
+#else /* !TNR_AOT_PROFILE_COLLECT — shipping build: the API exists but does nothing */
+int JS_AOTProfileInit(JSContext *ctx) { (void)ctx; return 0; }
+int JS_AOTProfileRegisterBundle(JSContext *ctx, JSValueConst root)
+{ (void)ctx; (void)root; return 0; }
+int JS_AOTProfileDump(JSContext *ctx, const char *path, const char *bundle)
+{ (void)ctx; (void)path; (void)bundle; return 0; }
+#endif /* TNR_AOT_PROFILE_COLLECT */
+
 const uint8_t *JS_AOTGetBytecode(const JSFunctionBytecode *b, int *plen)
 {
     if (plen)
@@ -260,6 +731,7 @@ JSContext *JS_AOTFrameEnter(JSContext *caller_ctx, JSAOTFrame *frame,
     JSStackFrame *sf = (JSStackFrame *)frame;
     int i, n;
     (void)this_obj;
+    TNR_PROF_NOTE_CALL(b);   /* v4.1: twin-frame call count (no-op unless collecting) */
     /* upstream a3f1b38 added sf->is_constructor (CallSite.prototype
        .isConstructor). The interpreter sets it from JS_CALL_FLAG_CONSTRUCTOR
        AFTER the twin-dispatch branch returns, so twins must set it here: a
@@ -1353,18 +1825,24 @@ static inline JSValue *js_aot_fld_slot(JSValueConst v, JSAtom atom,
     JSShapeProperty *prs;
     JSProperty *pr;
     if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
-        return NULL;
+        goto reject;
     p = JS_VALUE_GET_OBJ(v);
     if (p->class_id != JS_CLASS_OBJECT)
-        return NULL;
+        goto reject;
     prs = find_own_property(&pr, p, atom);
     if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
-        return NULL;
+        goto reject;
     if (need_write && !(prs->flags & JS_PROP_WRITABLE))
-        return NULL;
+        goto reject;
     if (need_num && !JS_AOT_IS_NUM(pr->u.value))
-        return NULL;
+        goto reject;
+    /* v4.1: this is THE observation point for v4.2's field hints — it is exactly the
+       speculation v3.4 makes blind. Compiles away entirely when not collecting. */
+    TNR_PROF_NOTE_FIELD(v, atom, &pr->u.value);
     return &pr->u.value;
+reject:
+    TNR_PROF_NOTE_FIELD(v, atom, (const JSValue *)NULL);
+    return NULL;
 }
 
 /* ---- v3.5d Math intrinsics (phase3 §14.4) ------------------------------------------
